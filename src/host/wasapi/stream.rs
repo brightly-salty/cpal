@@ -250,8 +250,8 @@ impl StreamTrait for Stream {
         )
     }
 
-    fn buffer_size(&self) -> Option<FrameCount> {
-        Some(self.period_frames)
+    fn buffer_size(&self) -> Result<FrameCount, crate::StreamError> {
+        Ok(self.period_frames)
     }
 }
 

@@ -71,11 +71,8 @@ impl StreamTrait for Stream {
         monotonic_stream_instant().expect("clock_gettime failed")
     }
 
-    fn buffer_size(&self) -> Option<crate::FrameCount> {
-        match self.last_quantum.load(Ordering::Relaxed) {
-            0 => None,
-            n => Some(n as _),
-        }
+    fn buffer_size(&self) -> Result<crate::FrameCount, crate::StreamError> {
+        Ok(self.last_quantum.load(Ordering::Relaxed) as _)
     }
 }
 
