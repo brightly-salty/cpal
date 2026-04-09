@@ -1,5 +1,6 @@
 use futures::executor::block_on;
 use pulseaudio::protocol;
+use std::time::Duration;
 
 mod stream;
 
@@ -10,9 +11,11 @@ use crate::{
     BackendSpecificError, BuildStreamError, Data, DefaultStreamConfigError, DeviceDescription,
     DeviceDescriptionBuilder, DeviceDirection, DeviceId, DeviceIdError, DeviceNameError,
     DevicesError, FrameCount, HostId, HostUnavailable, InputCallbackInfo, OutputCallbackInfo,
-    SampleFormat, StreamConfig, StreamError, SupportedBufferSize, SupportedStreamConfig,
-    SupportedStreamConfigRange, SupportedStreamConfigsError,
+    SampleFormat, SampleRate, StreamConfig, StreamError, SupportedBufferSize,
+    SupportedStreamConfig, SupportedStreamConfigRange, SupportedStreamConfigsError,
 };
+
+const MIN_SAMPLE_RATE: SampleRate = 8000;
 
 const PULSE_FORMATS: &[SampleFormat] = &[
     SampleFormat::U8,
@@ -160,10 +163,10 @@ fn supported_config_ranges() -> Vec<SupportedStreamConfigRange> {
             let max_frames = (protocol::MAX_MEMBLOCKQ_LENGTH / bytes_per_frame) as FrameCount;
             ranges.push(SupportedStreamConfigRange {
                 channels: channel_count as _,
-                min_sample_rate: 1,
+                min_sample_rate: MIN_SAMPLE_RATE,
                 max_sample_rate: protocol::sample_spec::MAX_RATE,
                 buffer_size: SupportedBufferSize::Range {
-                    min: 0,
+                    min: 1,
                     max: max_frames,
                 },
                 sample_format: *format,
@@ -187,7 +190,7 @@ fn default_config_from_spec(
         channels: channel_map.num_channels() as _,
         sample_rate: sample_spec.sample_rate,
         buffer_size: SupportedBufferSize::Range {
-            min: 0,
+            min: 1,
             max: max_frames,
         },
         sample_format,
@@ -246,7 +249,7 @@ impl DeviceTrait for Device {
         sample_format: SampleFormat,
         data_callback: D,
         error_callback: E,
-        _timeout: Option<std::time::Duration>,
+        timeout: Option<Duration>,
     ) -> Result<Self::Stream, BuildStreamError>
     where
         D: FnMut(&Data, &InputCallbackInfo) + Send + 'static,
@@ -281,7 +284,31 @@ impl DeviceTrait for Device {
             ..Default::default()
         };
 
-        stream::Stream::new_record(client.clone(), params, data_callback, error_callback)
+        let client = client.clone();
+        if let Some(dur) = timeout {
+            // Run stream creation on a thread so we can bound the wait. If the PulseAudio server
+            // is hung, `create_record_stream` would block forever.
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                tx.send(stream::Stream::new_record(
+                    client,
+                    params,
+                    data_callback,
+                    error_callback,
+                ))
+                .ok();
+            });
+            match rx.recv_timeout(dur) {
+                Ok(result) => result,
+                Err(_) => Err(BuildStreamError::BackendSpecific {
+                    err: BackendSpecificError {
+                        description: "timed out waiting for PulseAudio server".into(),
+                    },
+                }),
+            }
+        } else {
+            stream::Stream::new_record(client, params, data_callback, error_callback)
+        }
     }
 
     fn build_output_stream_raw<D, E>(
@@ -290,7 +317,7 @@ impl DeviceTrait for Device {
         sample_format: SampleFormat,
         data_callback: D,
         error_callback: E,
-        _timeout: Option<std::time::Duration>,
+        timeout: Option<Duration>,
     ) -> Result<Self::Stream, BuildStreamError>
     where
         D: FnMut(&mut Data, &OutputCallbackInfo) + Send + 'static,
@@ -325,7 +352,31 @@ impl DeviceTrait for Device {
             ..Default::default()
         };
 
-        stream::Stream::new_playback(client.clone(), params, data_callback, error_callback)
+        let client = client.clone();
+        if let Some(dur) = timeout {
+            // Run stream creation on a thread so we can bound the wait. If the PulseAudio server
+            // is hung, `create_playback_stream` would block forever.
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                tx.send(stream::Stream::new_playback(
+                    client,
+                    params,
+                    data_callback,
+                    error_callback,
+                ))
+                .ok();
+            });
+            match rx.recv_timeout(dur) {
+                Ok(result) => result,
+                Err(_) => Err(BuildStreamError::BackendSpecific {
+                    err: BackendSpecificError {
+                        description: "timed out waiting for PulseAudio server".into(),
+                    },
+                }),
+            }
+        } else {
+            stream::Stream::new_playback(client, params, data_callback, error_callback)
+        }
     }
 
     fn description(&self) -> Result<DeviceDescription, DeviceNameError> {
