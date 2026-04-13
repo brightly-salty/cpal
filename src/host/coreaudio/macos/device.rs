@@ -10,8 +10,14 @@ use crate::{
     OutputCallbackInfo, SampleFormat, SampleRate, StreamConfig, StreamError, SupportedBufferSize,
     SupportedStreamConfig, SupportedStreamConfigRange, SupportedStreamConfigsError,
 };
+use coreaudio::audio_unit::audio_format::LinearPcmFlags;
+use coreaudio::audio_unit::macos_helpers::{
+    find_matching_physical_format, set_device_physical_stream_format, RateListener,
+};
 use coreaudio::audio_unit::render_callback::{self, data};
-use coreaudio::audio_unit::{AudioUnit, Element, Scope};
+use coreaudio::audio_unit::{
+    AudioUnit, Element, SampleFormat as CoreAudioSampleFormat, Scope, StreamFormat,
+};
 use objc2_audio_toolbox::{
     kAudioOutputUnitProperty_CurrentDevice, kAudioOutputUnitProperty_EnableIO,
     kAudioUnitProperty_StreamFormat,
@@ -46,14 +52,45 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use super::invoke_error_callback;
-use super::property_listener::AudioObjectPropertyListener;
 use coreaudio::audio_unit::macos_helpers::get_device_name;
 
-/// Attempt to set the device sample rate to the provided rate.
-/// Return an error if the requested sample rate is not supported by the device.
+/// Try to find a matching physical stream format on the device and apply it.
+///
+/// Setting the physical format ensures the hardware runs at the requested bit depth and sample
+/// rate without unnecessary conversions.
+fn set_physical_format(
+    device_id: AudioDeviceID,
+    sample_rate: SampleRate,
+    channels: ChannelCount,
+    sample_format: SampleFormat,
+) -> Result<AudioStreamBasicDescription, coreaudio::Error> {
+    let core_format = match sample_format {
+        SampleFormat::I8 => CoreAudioSampleFormat::I8,
+        SampleFormat::I16 => CoreAudioSampleFormat::I16,
+        SampleFormat::I24 => CoreAudioSampleFormat::I24,
+        SampleFormat::I32 => CoreAudioSampleFormat::I32,
+        SampleFormat::F32 => CoreAudioSampleFormat::F32,
+        _ => return Err(coreaudio::Error::UnsupportedStreamFormat),
+    };
+    let stream_format = StreamFormat {
+        sample_rate: sample_rate as f64,
+        sample_format: core_format,
+        flags: LinearPcmFlags::empty(),
+        channels: channels as u32,
+    };
+    let asbd = find_matching_physical_format(device_id, stream_format)
+        .ok_or(coreaudio::Error::UnsupportedStreamFormat)?;
+    set_device_physical_stream_format(device_id, asbd).map(|_| asbd)
+}
+
+/// Set the device's nominal sample rate via `kAudioDevicePropertyNominalSampleRate`.
+///
+/// Unlike [`set_physical_format`], this only changes the device clock rate. The AudioUnit bridges
+/// any remaining format difference to the virtual stream format seen by the callback.
 fn set_sample_rate(
     audio_device_id: AudioObjectID,
     target_sample_rate: SampleRate,
+    timeout: Option<Duration>,
 ) -> Result<(), BuildStreamError> {
     // Get the current sample rate.
     let mut property_address = AudioObjectPropertyAddress {
@@ -76,7 +113,7 @@ fn set_sample_rate(
     coreaudio::Error::from_os_status(status)?;
 
     // If the requested sample rate is different to the device sample rate, update the device.
-    if sample_rate as u32 != target_sample_rate {
+    if (sample_rate - target_sample_rate as f64).abs() >= 1.0 {
         // Get available sample rate ranges.
         property_address.mSelector = kAudioDevicePropertyAvailableNominalSampleRates;
         let mut data_size = 0u32;
@@ -116,40 +153,13 @@ fn set_sample_rate(
             return Err(BuildStreamError::StreamConfigNotSupported);
         }
 
-        let (send, recv) = channel::<Result<f64, coreaudio::Error>>();
-        let sample_rate_address = AudioObjectPropertyAddress {
-            mSelector: kAudioDevicePropertyNominalSampleRate,
-            mScope: kAudioObjectPropertyScopeGlobal,
-            mElement: kAudioObjectPropertyElementMaster,
-        };
-        // Send sample rate updates back on a channel.
-        let sample_rate_handler = move || {
-            let mut rate: f64 = 0.0;
-            let mut data_size = mem::size_of::<f64>() as u32;
+        // Register the listener before setting the property so we don't miss the notification.
+        let (sender, receiver) = channel::<f64>();
+        let mut listener = RateListener::new(audio_device_id, Some(sender));
+        listener.register()?;
 
-            let result = unsafe {
-                AudioObjectGetPropertyData(
-                    audio_device_id,
-                    NonNull::from(&sample_rate_address),
-                    0,
-                    null(),
-                    NonNull::from(&mut data_size),
-                    NonNull::from(&mut rate).cast(),
-                )
-            };
-            send.send(coreaudio::Error::from_os_status(result).map(|_| rate))
-                .ok();
-        };
-
-        let listener = AudioObjectPropertyListener::new(
-            audio_device_id,
-            sample_rate_address,
-            sample_rate_handler,
-        )?;
-
-        // Finally, set the sample rate.
+        // Set the nominal sample rate.
         property_address.mSelector = kAudioDevicePropertyNominalSampleRate;
-        // Set the nominal sample rate using a single f64 as required by CoreAudio.
         let rate = sample_rate as f64;
         let data_size = mem::size_of::<f64>() as u32;
         let status = unsafe {
@@ -166,40 +176,38 @@ fn set_sample_rate(
 
         // Wait for the reported_rate to change.
         //
-        // This should not take longer than a few ms, but we timeout after 1 sec just in case.
-        // We loop over potentially several events from the channel to ensure
-        // that we catch the expected change in sample rate.
-        let mut timeout = Duration::from_secs(1);
+        // This should not take longer than a few ms. Use the caller's timeout if provided,
+        // otherwise default to 1 second. We loop over potentially several events from the
+        // channel to ensure that we catch the expected change in sample rate.
+        let mut remaining = timeout.unwrap_or(Duration::from_secs(1));
         let start = Instant::now();
-
         loop {
-            match recv.recv_timeout(timeout) {
-                Err(err) => {
-                    let description = match err {
-                        RecvTimeoutError::Disconnected => {
-                            "sample rate listener channel disconnected unexpectedly"
-                        }
-                        RecvTimeoutError::Timeout => {
-                            "timeout waiting for sample rate update for device"
-                        }
-                    }
-                    .to_string();
-                    return Err(BackendSpecificError { description }.into());
-                }
-                Ok(Ok(reported_sample_rate)) => {
-                    if reported_sample_rate == target_sample_rate as f64 {
+            match receiver.recv_timeout(remaining) {
+                Ok(reported_rate) => {
+                    if (reported_rate - target_sample_rate as f64).abs() < 1.0 {
                         break;
                     }
                 }
-                Ok(Err(_)) => {
-                    // TODO: should we consider collecting this error?
+                Err(RecvTimeoutError::Timeout) => {
+                    return Err(BackendSpecificError {
+                        description: "timeout waiting for sample rate update for device"
+                            .to_string(),
+                    }
+                    .into());
                 }
-            };
-            timeout = timeout
+                Err(RecvTimeoutError::Disconnected) => {
+                    return Err(BackendSpecificError {
+                        description: "sample rate listener channel disconnected unexpectedly"
+                            .to_string(),
+                    }
+                    .into());
+                }
+            }
+            remaining = remaining
                 .checked_sub(start.elapsed())
                 .unwrap_or(Duration::ZERO);
         }
-        listener.remove()?;
+        // listener dropped here; its Drop impl calls unregister() automatically.
     }
     Ok(())
 }
@@ -738,7 +746,7 @@ impl Device {
         sample_format: SampleFormat,
         mut data_callback: D,
         error_callback: E,
-        _timeout: Option<Duration>,
+        timeout: Option<Duration>,
     ) -> Result<Stream, BuildStreamError>
     where
         D: FnMut(&Data, &InputCallbackInfo) + Send + 'static,
@@ -748,8 +756,19 @@ impl Device {
         let scope = Scope::Output;
         let element = Element::Input;
 
-        // Potentially change the device sample rate to match the config.
-        set_sample_rate(self.audio_device_id, config.sample_rate)?;
+        // Set the physical stream format (bit depth + sample rate) on the hardware device.
+        // This avoids unnecessary format conversions, which is especially important on aggregate
+        // devices. Falls back to sample-rate-only if no matching physical format is available.
+        if set_physical_format(
+            self.audio_device_id,
+            config.sample_rate,
+            config.channels,
+            sample_format,
+        )
+        .is_err()
+        {
+            set_sample_rate(self.audio_device_id, config.sample_rate, timeout)?;
+        }
 
         let mut loopback_aggregate: Option<LoopbackDevice> = None;
         let mut audio_unit = if self.supports_input() {
@@ -842,12 +861,26 @@ impl Device {
         sample_format: SampleFormat,
         mut data_callback: D,
         error_callback: E,
-        _timeout: Option<Duration>,
+        timeout: Option<Duration>,
     ) -> Result<Stream, BuildStreamError>
     where
         D: FnMut(&mut Data, &OutputCallbackInfo) + Send + 'static,
         E: FnMut(StreamError) + Send + 'static,
     {
+        // Best-effort: set the physical stream format (bit depth + sample rate) on the hardware.
+        // This avoids unnecessary conversions, especially on aggregate devices. Not an error if
+        // it fails — the AudioUnit will handle format conversion as before.
+        if set_physical_format(
+            self.audio_device_id,
+            config.sample_rate,
+            config.channels,
+            sample_format,
+        )
+        .is_err()
+        {
+            set_sample_rate(self.audio_device_id, config.sample_rate, timeout)?;
+        }
+
         let mut audio_unit = audio_unit_from_device(self, false)?;
 
         // The scope and element for working with a device's output stream.
