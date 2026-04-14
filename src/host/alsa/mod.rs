@@ -1459,7 +1459,7 @@ fn set_hw_params_from_format(
     // buffer_size = 2x and period_size = x. This provides consistent low-latency
     // behavior across different ALSA implementations and hardware.
     if let BufferSize::Fixed(buffer_frames) = config.buffer_size {
-        hw_params.set_buffer_size_near((2 * buffer_frames) as alsa::pcm::Frames)?;
+        hw_params.set_buffer_size_near(2 * buffer_frames as alsa::pcm::Frames)?;
         hw_params
             .set_period_size_near(buffer_frames as alsa::pcm::Frames, alsa::ValueOr::Nearest)?;
     }

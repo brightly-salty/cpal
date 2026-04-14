@@ -501,14 +501,17 @@ fn make_playback_buffer_attr(
     match config.buffer_size {
         crate::BufferSize::Default => Default::default(),
         crate::BufferSize::Fixed(frame_count) => {
-            let len = frame_count * config.channels as u32 * format.bytes_per_sample() as u32;
+            let len =
+                (frame_count as u64 * config.channels as u64 * format.bytes_per_sample() as u64)
+                    .min(u32::MAX as u64) as u32;
+            let double_len = (len as u64 * 2).min(u32::MAX as u64) as u32;
             protocol::stream::BufferAttr {
                 // Double-buffer: total buffer = 2 callback periods. With
                 // adjust_latency this becomes the end-to-end latency target,
                 // Minimum request = one callback period, ensuring the server
                 // always asks for exactly frame_count frames per call.
-                max_length: 2 * len,
-                target_length: 2 * len,
+                max_length: double_len,
+                target_length: double_len,
                 minimum_request_length: len,
                 ..Default::default()
             }
@@ -523,7 +526,9 @@ fn make_record_buffer_attr(
     match config.buffer_size {
         crate::BufferSize::Default => Default::default(),
         crate::BufferSize::Fixed(frame_count) => {
-            let len = frame_count * config.channels as u32 * format.bytes_per_sample() as u32;
+            let len =
+                (frame_count as u64 * config.channels as u64 * format.bytes_per_sample() as u64)
+                    .min(u32::MAX as u64) as u32;
             protocol::stream::BufferAttr {
                 // fragment_size controls the delivery chunk size for record
                 // streams; target_length is playback-only and is ignored here.

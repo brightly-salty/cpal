@@ -84,13 +84,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **AAudio**: Fix thread lock when a stream is dropped before it fully starts.
 - **AAudio**: Fix capture and playback timestamps falling back to time-zero on error.
 - **AAudio**: Fix capture and playback timestamp not accounting for audio pipeline buffer depth.
-- **AAudio**: Fix signed overflow in `buffer_capacity_in_frames` for large fixed buffer sizes.
+- **AAudio**: Fix overflow in `buffer_capacity_in_frames` for large fixed buffer sizes.
 - **ALSA**: Fix capture stream hanging or spinning on overruns.
 - **ALSA**: Fix non-monotonic `StreamInstant` during stream startup.
 - **ALSA**: Fix spurious timestamp errors during stream startup.
 - **ALSA**: Fix spurious timeout errors during polling.
 - **ALSA**: Fix rare panics when dropping the stream is interrupted.
 - **ALSA**: Fix timestamp overflows on 32-bit platforms.
+- **ALSA**: Fix overflow in `buffer_capacity_in_frames` for large fixed buffer sizes.
 - **ASIO**: Fix enumeration returning only the first device when using `collect()`.
 - **ASIO**: Fix device enumeration and stream creation failing when called from spawned threads.
 - **ASIO**: Fix buffer size not resizing when the driver reports `kAsioBufferSizeChange`.
