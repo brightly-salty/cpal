@@ -219,9 +219,13 @@ impl Stream {
         let error_callback_clone = error_callback.clone();
         std::thread::spawn(move || {
             if let Err(e) = block_on(stream_clone.play_all()) {
-                error_callback_clone.lock().unwrap()(StreamError::from(BackendSpecificError {
-                    description: e.to_string(),
-                }));
+                error_callback_clone
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())(StreamError::from(
+                    BackendSpecificError {
+                        description: e.to_string(),
+                    },
+                ));
             }
         });
 
@@ -239,9 +243,11 @@ impl Stream {
             let timing_info = match block_on(stream_clone.timing_info()) {
                 Ok(timing_info) => timing_info,
                 Err(e) => {
-                    error_callback.lock().unwrap()(StreamError::from(BackendSpecificError {
-                        description: e.to_string(),
-                    }));
+                    error_callback.lock().unwrap_or_else(|e| e.into_inner())(StreamError::from(
+                        BackendSpecificError {
+                            description: e.to_string(),
+                        },
+                    ));
                     break;
                 }
             };
