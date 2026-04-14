@@ -16,34 +16,36 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 /// Shared state for extending the 32-bit `timeGetTime()` millisecond counter into a
-/// monotonic 64-bit value, shared between `now()` and audio callbacks.
-pub(super) struct TimeBase {
-    pub last_ms: AtomicU32,
-    pub epoch_ms: AtomicU64,
+/// monotonic 64-bit nanosecond value, shared between `now()` and audio callbacks.
+struct TimeBase {
+    last_ns: AtomicU64,
+    epoch_ns: AtomicU64,
 }
 
+/// Nanosecond span of one full `timeGetTime()` wrap period (~49.7 days).
+const TIMEGETIME_WRAP_NS: u64 = (u32::MAX as u64 + 1) * 1_000_000;
+
 impl TimeBase {
-    pub fn new() -> Self {
+    fn new() -> Self {
         Self {
-            last_ms: AtomicU32::new(0),
-            epoch_ms: AtomicU64::new(0),
+            last_ns: AtomicU64::new(0),
+            epoch_ns: AtomicU64::new(0),
         }
     }
 
-    /// Convert a `timeGetTime()` millisecond value to a monotonic `StreamInstant`,
-    /// extending the 32-bit counter across its ~49.7-day wrap.
-    fn to_stream_instant(&self, ms: u32) -> StreamInstant {
+    /// Convert a nanosecond timestamp to a monotonic `StreamInstant`.
+    fn to_stream_instant(&self, ns: u64) -> StreamInstant {
         // `Relaxed` is sufficient: callbacks run on a single ASIO thread. The only
         // cross-thread caller is `now()`, which may race at wrap time (~1µs every 49.7 days).
-        let prev = self.last_ms.swap(ms, Ordering::Relaxed);
-        let epoch = if ms < prev {
-            self.epoch_ms
-                .fetch_add(u32::MAX as u64 + 1, Ordering::Relaxed)
-                + (u32::MAX as u64 + 1)
+        let prev = self.last_ns.swap(ns, Ordering::Relaxed);
+        let epoch = if ns < prev {
+            self.epoch_ns
+                .fetch_add(TIMEGETIME_WRAP_NS, Ordering::Relaxed)
+                + TIMEGETIME_WRAP_NS
         } else {
-            self.epoch_ms.load(Ordering::Relaxed)
+            self.epoch_ns.load(Ordering::Relaxed)
         };
-        StreamInstant::from_millis(epoch + ms as u64)
+        StreamInstant::from_nanos(epoch + ns)
     }
 }
 
@@ -68,7 +70,7 @@ impl Stream {
         // derived from `timeGetTime()`, so calling it here gives a value on the
         // same clock as the `system_time` field delivered to every callback.
         let ms = unsafe { windows::Win32::Media::timeGetTime() };
-        self.time_base.to_stream_instant(ms)
+        self.time_base.to_stream_instant(ms as u64 * 1_000_000)
     }
 
     pub fn play(&self) -> Result<(), PlayStreamError> {
@@ -195,8 +197,7 @@ impl Device {
 
             let hardware_input_latency = hardware_input_latency.load(Ordering::Relaxed) as usize;
 
-            let callback_instant =
-                time_base_cb.to_stream_instant((callback_info.system_time / 1_000_000) as u32);
+            let callback_instant = time_base_cb.to_stream_instant(callback_info.system_time);
 
             /// 1. Write from the ASIO buffer to the interleaved CPAL buffer.
             /// 2. Deliver the CPAL buffer to the user callback.
@@ -498,8 +499,7 @@ impl Device {
 
             let hardware_output_latency = hardware_output_latency.load(Ordering::Relaxed) as usize;
 
-            let callback_instant =
-                time_base_cb.to_stream_instant((callback_info.system_time / 1_000_000) as u32);
+            let callback_instant = time_base_cb.to_stream_instant(callback_info.system_time);
 
             // Silence the ASIO buffer that is about to be used.
             //
