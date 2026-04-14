@@ -185,6 +185,18 @@ impl DeviceTrait for Device {
     }
 
     /// Create an output stream.
+    ///
+    /// # Async completion
+    ///
+    /// This function returns `Ok` synchronously once the [`AudioContext`] is created, before the
+    /// AudioWorklet module has been loaded or the [`AudioWorkletNode`] has been initialized. The
+    /// actual worklet setup runs asynchronously via [`wasm_bindgen_futures::spawn_local`]. If
+    /// setup fails (e.g. `add_module` or `AudioWorkletNode` construction throws), the error is
+    /// delivered to `error_callback` after the caller already holds a [`Stream`]. There is no
+    /// way to surface such errors synchronously given the Web Audio API's design.
+    ///
+    /// [`AudioContext`]: web_sys::AudioContext
+    /// [`AudioWorkletNode`]: web_sys::AudioWorkletNode
     fn build_output_stream_raw<D, E>(
         &self,
         config: StreamConfig,
@@ -458,20 +470,8 @@ impl WasmAudioProcessor {
 
     /// Converts this `WasmAudioProcessor` into a raw pointer (as `usize`) for FFI use.
     ///
-    /// # Purpose
-    /// This function is intended to transfer ownership of the processor instance to the caller,
-    /// typically for passing between Rust and JavaScript via WebAssembly.
-    ///
-    /// # Relationship with [`unpack`]
-    /// The returned pointer must be passed to [`unpack`] exactly once to recover the original
-    /// `WasmAudioProcessor` instance. Failing to do so will result in a memory leak. Calling
-    /// [`unpack`] more than once or using the pointer after it has been unpacked will result in
-    /// undefined behavior.
-    ///
-    /// # Safety and Lifetime
-    /// After calling `pack`, the caller is responsible for ensuring that `unpack` is called
-    /// exactly once, and that the pointer is not used after being unpacked. This function
-    /// should be used with care, as improper use can lead to memory safety issues.
+    /// Transfers ownership of the processor to the caller. The returned pointer must be passed to
+    /// [`unpack`] exactly once. Failing to call [`unpack`] will leak the allocation.
     ///
     /// [`unpack`]: Self::unpack
     pub fn pack(self) -> usize {
