@@ -6,14 +6,6 @@ mod device;
 mod stream;
 mod utils;
 
-#[inline]
-fn pipewire_available() -> bool {
-    let dir = std::env::var("PIPEWIRE_RUNTIME_DIR")
-        .or_else(|_| std::env::var("XDG_RUNTIME_DIR"))
-        .unwrap_or_default();
-    std::path::Path::new(&dir).join("pipewire-0").exists()
-}
-
 pub struct Host {
     // Keeps PipeWire initialized for the lifetime of the host, preventing
     // pw_deinit() from running between device enumeration and stream creation.
@@ -33,7 +25,7 @@ impl HostTrait for Host {
     type Devices = Devices;
     type Device = Device;
     fn is_available() -> bool {
-        pipewire_available()
+        utils::find_socket_path().is_some()
     }
     fn devices(&self) -> Result<Self::Devices, crate::DevicesError> {
         Ok(self.devices.clone().into_iter())
