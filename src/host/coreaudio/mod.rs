@@ -1,6 +1,6 @@
 //! CoreAudio backend implementation.
 //!
-//! Default backend on macOS and iOS.
+//! Default backend on macOS, iOS, and tvOS.
 
 use objc2_core_audio_types::{
     kAudioFormatFlagIsFloat, kAudioFormatFlagIsPacked, kAudioFormatFlagIsSignedInteger,
@@ -12,12 +12,14 @@ use crate::{BuildStreamError, SupportedStreamConfigsError};
 
 use crate::{BackendSpecificError, SampleFormat, StreamConfig};
 
-#[cfg(target_os = "ios")]
+// iOS and tvOS share the same CoreAudio / AudioUnit surface (RemoteIO,
+// AVAudioSession), so both target the `ios` submodule.
+#[cfg(not(target_os = "macos"))]
 mod ios;
 #[cfg(target_os = "macos")]
 mod macos;
 
-#[cfg(target_os = "ios")]
+#[cfg(not(target_os = "macos"))]
 #[allow(unused_imports)]
 pub use self::ios::{
     enumerate::{Devices, SupportedInputConfigs, SupportedOutputConfigs},
