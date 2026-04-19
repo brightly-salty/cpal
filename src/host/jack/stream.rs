@@ -4,7 +4,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::{
-    Data, Error, ErrorKind, InputCallbackInfo, OutputCallbackInfo, SampleRate, StreamInstant,
+    error::ResultExt, Data, Error, ErrorKind, InputCallbackInfo, OutputCallbackInfo, SampleRate,
+    StreamInstant,
 };
 
 use super::JACK_SAMPLE_FORMAT;
@@ -40,12 +41,7 @@ impl Stream {
         for i in 0..channels {
             let port = client
                 .register_port(&format!("in_{}", i), jack::AudioIn::default())
-                .map_err(|e| {
-                    Error::with_message(
-                        ErrorKind::DeviceNotAvailable,
-                        format!("failed to register input port {i}: {e}"),
-                    )
-                })?;
+                .context(format!("failed to register input port {i}"))?;
             if let Ok(port_name) = port.name() {
                 port_names.push(port_name);
             }
@@ -69,12 +65,7 @@ impl Stream {
 
         let async_client = client
             .activate_async(notification_handler, input_process_handler)
-            .map_err(|e| {
-                Error::with_message(
-                    ErrorKind::DeviceNotAvailable,
-                    format!("failed to activate JACK client: {e:?}"),
-                )
-            })?;
+            .context("failed to activate JACK client")?;
 
         Ok(Self {
             playing,
@@ -99,12 +90,7 @@ impl Stream {
         for i in 0..channels {
             let port = client
                 .register_port(&format!("out_{}", i), jack::AudioOut::default())
-                .map_err(|e| {
-                    Error::with_message(
-                        ErrorKind::DeviceNotAvailable,
-                        format!("failed to register output port {i}: {e}"),
-                    )
-                })?;
+                .context(format!("failed to register output port {i}"))?;
             if let Ok(port_name) = port.name() {
                 port_names.push(port_name);
             }
@@ -128,12 +114,7 @@ impl Stream {
 
         let async_client = client
             .activate_async(notification_handler, output_process_handler)
-            .map_err(|e| {
-                Error::with_message(
-                    ErrorKind::DeviceNotAvailable,
-                    format!("failed to activate JACK client: {e:?}"),
-                )
-            })?;
+            .context("failed to activate JACK client")?;
 
         Ok(Self {
             playing,

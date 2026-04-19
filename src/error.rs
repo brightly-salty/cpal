@@ -151,11 +151,11 @@ impl From<ErrorKind> for Error {
 pub(crate) trait ResultExt<T> {
     /// Converts the error via [`Into<cpal::Error>`] and prepends `msg`, yielding
     /// `"<msg>: <original error>"` as the message.
-    fn context(self, msg: &'static str) -> Result<T, Error>;
+    fn context(self, msg: impl Display) -> Result<T, Error>;
 }
 
 impl<T, E: Into<Error>> ResultExt<T> for Result<T, E> {
-    fn context(self, msg: &'static str) -> Result<T, Error> {
+    fn context(self, msg: impl Display) -> Result<T, Error> {
         self.map_err(|e| {
             let e = e.into();
             Error::with_message(e.kind(), format!("{msg}: {e}"))
