@@ -6,19 +6,26 @@ extern crate js_sys;
 extern crate wasm_bindgen;
 extern crate web_sys;
 
-use self::wasm_bindgen::prelude::*;
-use self::wasm_bindgen::JsCast;
-use self::web_sys::{AudioContext, AudioContextOptions};
-use crate::traits::{DeviceTrait, HostTrait, StreamTrait};
+use std::{
+    ops::DerefMut,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex, RwLock,
+    },
+    time::Duration,
+};
+
+use self::{
+    wasm_bindgen::{prelude::*, JsCast},
+    web_sys::{AudioContext, AudioContextOptions},
+};
 use crate::{
-    BufferSize, Data, DeviceDescription, DeviceDescriptionBuilder, DeviceId, Error, ErrorKind,
-    InputCallbackInfo, OutputCallbackInfo, SampleFormat, SampleRate, StreamConfig, StreamInstant,
+    traits::{DeviceTrait, HostTrait, StreamTrait},
+    BufferSize, ChannelCount, Data, DeviceDescription, DeviceDescriptionBuilder, DeviceDirection,
+    DeviceId, Error, ErrorKind, FrameCount, InputCallbackInfo, OutputCallbackInfo,
+    OutputStreamTimestamp, SampleFormat, SampleRate, StreamConfig, StreamInstant,
     SupportedBufferSize, SupportedStreamConfig, SupportedStreamConfigRange,
 };
-use std::ops::DerefMut;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
-use std::time::Duration;
 
 /// Type alias for shared closure handles used in audio callbacks
 type ClosureHandle = Arc<RwLock<Option<Closure<dyn FnMut()>>>>;
@@ -49,8 +56,8 @@ crate::assert_stream_sync!(Stream);
 
 pub use crate::iter::{SupportedInputConfigs, SupportedOutputConfigs};
 
-const MIN_CHANNELS: u16 = 1;
-const MAX_CHANNELS: u16 = 32;
+const MIN_CHANNELS: ChannelCount = 1;
+const MAX_CHANNELS: ChannelCount = 32;
 const MIN_SAMPLE_RATE: SampleRate = 8_000;
 const MAX_SAMPLE_RATE: SampleRate = 96_000;
 const DEFAULT_SAMPLE_RATE: SampleRate = 44_100;
@@ -60,8 +67,8 @@ const DEFAULT_BUFFER_SIZE: usize = 2048;
 const SUPPORTED_SAMPLE_FORMAT: SampleFormat = SampleFormat::F32;
 
 impl Host {
-    pub fn new() -> Result<Self, crate::Error> {
-        Ok(Host)
+    pub fn new() -> Result<Self, Error> {
+        Ok(Self)
     }
 }
 
@@ -75,7 +82,7 @@ impl HostTrait for Host {
     }
 
     fn devices(&self) -> Result<Self::Devices, Error> {
-        Devices::new()
+        Self::Devices::new()
     }
 
     fn default_input_device(&self) -> Option<Self::Device> {
@@ -96,7 +103,7 @@ impl Devices {
 impl Device {
     fn description(&self) -> Result<DeviceDescription, Error> {
         Ok(DeviceDescriptionBuilder::new("Default Device".to_string())
-            .direction(crate::DeviceDirection::Output)
+            .direction(DeviceDirection::Output)
             .build())
     }
 
@@ -155,27 +162,27 @@ impl DeviceTrait for Device {
     type Stream = Stream;
 
     fn description(&self) -> Result<DeviceDescription, Error> {
-        Device::description(self)
+        Self::description(self)
     }
 
     fn id(&self) -> Result<DeviceId, Error> {
-        Device::id(self)
+        Self::id(self)
     }
 
     fn supported_input_configs(&self) -> Result<Self::SupportedInputConfigs, Error> {
-        Device::supported_input_configs(self)
+        Self::supported_input_configs(self)
     }
 
     fn supported_output_configs(&self) -> Result<Self::SupportedOutputConfigs, Error> {
-        Device::supported_output_configs(self)
+        Self::supported_output_configs(self)
     }
 
     fn default_input_config(&self) -> Result<SupportedStreamConfig, Error> {
-        Device::default_input_config(self)
+        Self::default_input_config(self)
     }
 
     fn default_output_config(&self) -> Result<SupportedStreamConfig, Error> {
-        Device::default_output_config(self)
+        Self::default_output_config(self)
     }
 
     fn build_input_stream_raw<D, E>(
@@ -363,7 +370,7 @@ impl DeviceTrait for Device {
                                 let playback = StreamInstant::from_secs_f64(
                                     time_at_start_of_buffer + total_hw_latency_secs,
                                 );
-                                let timestamp = crate::OutputStreamTimestamp { callback, playback };
+                                let timestamp = OutputStreamTimestamp { callback, playback };
                                 let info = OutputCallbackInfo { timestamp };
                                 (data_callback.deref_mut())(&mut data, &info);
                             }
@@ -493,7 +500,7 @@ impl DeviceTrait for Device {
             on_ended_closures.push(on_ended_closure);
         }
 
-        Ok(Stream {
+        Ok(Self::Stream {
             ctx,
             on_ended_closures,
             config,
@@ -568,8 +575,8 @@ impl StreamTrait for Stream {
         StreamInstant::from_secs_f64(self.ctx.current_time())
     }
 
-    fn buffer_size(&self) -> Result<crate::FrameCount, Error> {
-        Ok(self.buffer_size_frames as crate::FrameCount)
+    fn buffer_size(&self) -> Result<FrameCount, Error> {
+        Ok(self.buffer_size_frames as FrameCount)
     }
 }
 
@@ -589,8 +596,7 @@ impl Default for Devices {
 impl Iterator for Devices {
     type Item = Device;
 
-    #[inline]
-    fn next(&mut self) -> Option<Device> {
+    fn next(&mut self) -> Option<Self::Item> {
         if self.0 {
             self.0 = false;
             Some(Device)

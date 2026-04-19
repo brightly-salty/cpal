@@ -1,5 +1,9 @@
-use super::{check_os_status, Device};
-use crate::Error;
+use std::{
+    mem,
+    ptr::{null, NonNull},
+    vec::IntoIter as VecIntoIter,
+};
+
 use objc2_core_audio::{
     kAudioHardwareNoError, kAudioHardwarePropertyDefaultInputDevice,
     kAudioHardwarePropertyDefaultOutputDevice, kAudioHardwarePropertyDevices,
@@ -7,9 +11,10 @@ use objc2_core_audio::{
     AudioDeviceID, AudioObjectGetPropertyData, AudioObjectGetPropertyDataSize, AudioObjectID,
     AudioObjectPropertyAddress,
 };
-use std::mem;
-use std::ptr::{null, NonNull};
-use std::vec::IntoIter as VecIntoIter;
+
+use super::{check_os_status, Device};
+pub use crate::iter::{SupportedInputConfigs, SupportedOutputConfigs};
+use crate::Error;
 
 unsafe fn audio_devices() -> Result<Vec<AudioDeviceID>, Error> {
     let property_address = AudioObjectPropertyAddress {
@@ -60,15 +65,15 @@ pub struct Devices(VecIntoIter<AudioDeviceID>);
 impl Devices {
     pub fn new() -> Result<Self, Error> {
         let devices = unsafe { audio_devices() }?;
-        Ok(Devices(devices.into_iter()))
+        Ok(Self(devices.into_iter()))
     }
 }
 
 impl Iterator for Devices {
     type Item = Device;
 
-    fn next(&mut self) -> Option<Device> {
-        self.0.next().map(|id| Device {
+    fn next(&mut self) -> Option<Self::Item> {
+        self.0.next().map(|id| Self::Item {
             audio_device_id: id,
         })
     }
@@ -127,5 +132,3 @@ pub fn default_output_device() -> Option<Device> {
     let device = Device { audio_device_id };
     Some(device)
 }
-
-pub use crate::iter::{SupportedInputConfigs, SupportedOutputConfigs};

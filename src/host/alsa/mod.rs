@@ -18,15 +18,18 @@ use std::{
 
 use self::alsa::poll::Descriptors;
 pub use self::enumerate::Devices;
-
 use crate::{
-    host::fill_with_equilibrium,
+    host::{
+        equilibrium::{fill_equilibrium, DSD_EQUILIBRIUM_BYTE, U8_EQUILIBRIUM_BYTE},
+        frames_to_duration,
+    },
     iter::{SupportedInputConfigs, SupportedOutputConfigs},
     traits::{DeviceTrait, HostTrait, StreamTrait},
     BufferSize, ChannelCount, Data, DeviceDescription, DeviceDescriptionBuilder, DeviceDirection,
-    DeviceId, Error, ErrorKind, FrameCount, InputCallbackInfo, OutputCallbackInfo, SampleFormat,
-    SampleRate, StreamConfig, StreamInstant, SupportedBufferSize, SupportedStreamConfig,
-    SupportedStreamConfigRange,
+    DeviceId, Error, ErrorKind, FrameCount, InputCallbackInfo, InputStreamTimestamp,
+    OutputCallbackInfo, OutputStreamTimestamp, SampleFormat, SampleRate, StreamConfig,
+    StreamInstant, SupportedBufferSize, SupportedStreamConfig, SupportedStreamConfigRange,
+    COMMON_SAMPLE_RATES,
 };
 
 mod enumerate;
@@ -97,11 +100,11 @@ pub struct Host {
 }
 
 impl Host {
-    pub fn new() -> Result<Self, crate::Error> {
+    pub fn new() -> Result<Self, Error> {
         let inner = AlsaContext::new().map_err(|e| {
             Error::with_message(ErrorKind::HostUnavailable, format!("ALSA unavailable: {e}"))
         })?;
-        Ok(Host {
+        Ok(Self {
             inner: Arc::new(inner),
         })
     }
@@ -120,19 +123,19 @@ impl HostTrait for Host {
         self.enumerate_devices()
     }
 
-    fn device_by_id(&self, id: &crate::DeviceId) -> Option<Self::Device> {
-        let canonical_id = crate::DeviceId(id.0, canonical_pcm_id(&id.1));
+    fn device_by_id(&self, id: &DeviceId) -> Option<Self::Device> {
+        let canonical_id = DeviceId(id.0, canonical_pcm_id(&id.1));
         self.devices()
             .ok()?
             .find(|d| d.id().ok().as_ref() == Some(&canonical_id))
     }
 
     fn default_input_device(&self) -> Option<Self::Device> {
-        Some(Device::default())
+        Some(Self::Device::default())
     }
 
     fn default_output_device(&self) -> Option<Self::Device> {
-        Some(Device::default())
+        Some(Self::Device::default())
     }
 }
 
@@ -171,15 +174,15 @@ impl DeviceTrait for Device {
 
     // ALSA overrides name() to return pcm_id directly instead of from description
     fn name(&self) -> Result<String, Error> {
-        Device::name(self)
+        Self::name(self)
     }
 
     fn description(&self) -> Result<DeviceDescription, Error> {
-        Device::description(self)
+        Self::description(self)
     }
 
     fn id(&self) -> Result<DeviceId, Error> {
-        Device::id(self)
+        Self::id(self)
     }
 
     // Override trait defaults to avoid opening devices during enumeration.
@@ -202,19 +205,19 @@ impl DeviceTrait for Device {
     }
 
     fn supported_input_configs(&self) -> Result<Self::SupportedInputConfigs, Error> {
-        Device::supported_input_configs(self)
+        Self::supported_input_configs(self)
     }
 
     fn supported_output_configs(&self) -> Result<Self::SupportedOutputConfigs, Error> {
-        Device::supported_output_configs(self)
+        Self::supported_output_configs(self)
     }
 
     fn default_input_config(&self) -> Result<SupportedStreamConfig, Error> {
-        Device::default_input_config(self)
+        Self::default_input_config(self)
     }
 
     fn default_output_config(&self) -> Result<SupportedStreamConfig, Error> {
-        Device::default_output_config(self)
+        Self::default_output_config(self)
     }
 
     fn build_input_stream_raw<D, E>(
@@ -280,8 +283,9 @@ impl TriggerSender {
             }
             // write() can be interrupted by a signal before writing any bytes; retry.
             assert_eq!(ret, -1, "wakeup: unexpected return value {ret}");
-            if std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
-                panic!("wakeup: {}", std::io::Error::last_os_error());
+            let err = std::io::Error::last_os_error();
+            if err.kind() != std::io::ErrorKind::Interrupted {
+                panic!("wakeup: {err}");
             }
         }
     }
@@ -297,8 +301,9 @@ impl TriggerReceiver {
             }
             // read() can be interrupted by a signal before reading any bytes; retry.
             assert_eq!(ret, -1, "clear_pipe: unexpected return value {ret}");
-            if std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
-                panic!("clear_pipe: {}", std::io::Error::last_os_error());
+            let err = std::io::Error::last_os_error();
+            if err.kind() != std::io::ErrorKind::Interrupted {
+                panic!("clear_pipe: {err}");
             }
         }
     }
@@ -410,16 +415,11 @@ impl Device {
             handle.start()?;
         }
 
-        // Pre-compute a period-sized buffer filled with silence values.
         let period_frames = period_samples / conf.channels as usize;
         let frame_size = sample_format.sample_size() * conf.channels as usize;
         let period_bytes = period_frames * frame_size;
-        let mut silence_template = vec![0u8; period_bytes].into_boxed_slice();
 
-        // Only fill buffer for unsigned formats that don't have a zero value for silence.
-        if sample_format.is_uint() {
-            fill_with_equilibrium(&mut silence_template, sample_format);
-        }
+        let equilibrium_fill = EquilibriumFill::new(sample_format, period_bytes);
 
         let stream_inner = StreamInner {
             dropping: AtomicBool::new(false),
@@ -430,7 +430,7 @@ impl Device {
             period_samples,
             period_frames,
             frame_size,
-            silence_template,
+            equilibrium: equilibrium_fill,
             can_pause,
             creation_instant,
             use_hw_timestamps,
@@ -550,7 +550,7 @@ impl Device {
             vec![(min_rate, max_rate)]
         } else {
             let mut rates = Vec::new();
-            for &sample_rate in crate::COMMON_SAMPLE_RATES.iter() {
+            for &sample_rate in COMMON_SAMPLE_RATES.iter() {
                 if hw_params.test_rate(sample_rate).is_ok() {
                     rates.push((sample_rate, sample_rate));
                 }
@@ -672,6 +672,43 @@ impl Default for Device {
     }
 }
 
+/// Strategy for pre-filling an output buffer with the equilibrium value.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum EquilibriumFill {
+    /// Equilibrium is represented as a single repeating byte value.
+    Byte(u8),
+    /// A period-sized buffer pre-filled with the equilibrium value.
+    Template(Box<[u8]>),
+}
+
+impl EquilibriumFill {
+    /// Compute the equilibrium-fill strategy for the given sample format at stream creation.
+    fn new(sample_format: SampleFormat, period_bytes: usize) -> Self {
+        if sample_format.is_int() || sample_format.is_float() {
+            Self::Byte(0)
+        } else if sample_format == SampleFormat::U8 {
+            Self::Byte(U8_EQUILIBRIUM_BYTE)
+        } else if sample_format.is_dsd() {
+            Self::Byte(DSD_EQUILIBRIUM_BYTE)
+        } else {
+            // Multi-byte unsigned integer formats require a fill equal to the midpoint of their
+            // range.
+            debug_assert!(sample_format.is_uint());
+            let mut template = vec![0u8; period_bytes].into_boxed_slice();
+            fill_equilibrium(&mut template, sample_format);
+            Self::Template(template)
+        }
+    }
+
+    #[inline]
+    fn fill(&self, buffer: &mut [u8]) {
+        match self {
+            Self::Byte(b) => buffer.fill(*b),
+            Self::Template(t) => buffer.copy_from_slice(t),
+        }
+    }
+}
+
 #[derive(Debug)]
 struct StreamInner {
     // Flag used to check when to stop polling, regardless of the state of the stream
@@ -695,7 +732,7 @@ struct StreamInner {
     period_samples: usize,
     period_frames: usize,
     frame_size: usize,
-    silence_template: Box<[u8]>,
+    equilibrium: EquilibriumFill,
 
     #[allow(dead_code)]
     // Whether or not the hardware supports pausing the stream.
@@ -754,8 +791,9 @@ impl StreamWorkerContext {
             -1 // Don't timeout, wait forever.
         };
 
-        // Pre-allocate buffer to exactly one period size with proper equilibrium values.
-        let transfer_buffer = stream.silence_template.clone();
+        // Pre-allocate a period-sized working buffer. Contents are overwritten each callback.
+        let transfer_buffer =
+            vec![0u8; stream.period_frames * stream.frame_size].into_boxed_slice();
 
         // Pre-allocate and initialize descriptors vector: 1 for self-pipe + stream.num_descriptors
         // for ALSA. The descriptor count is constant for the lifetime of stream parameters, and
@@ -1063,12 +1101,12 @@ fn process_input(
     } else {
         stream_timestamp_fallback(stream.creation_instant)
     }?;
-    let delay_duration = frames_to_duration(delay_frames, stream.conf.sample_rate);
+    let delay_duration = frames_to_duration(delay_frames as FrameCount, stream.conf.sample_rate);
     let capture = callback
         .checked_sub(delay_duration)
         .unwrap_or(StreamInstant::ZERO);
-    let timestamp = crate::InputStreamTimestamp { callback, capture };
-    let info = crate::InputCallbackInfo { timestamp };
+    let timestamp = InputStreamTimestamp { callback, capture };
+    let info = InputCallbackInfo { timestamp };
     data_callback(&data, &info);
 
     Ok(())
@@ -1082,8 +1120,8 @@ fn process_output(
     delay_frames: usize,
     data_callback: &mut (dyn FnMut(&mut Data, &OutputCallbackInfo) + Send + 'static),
 ) -> Result<(), Error> {
-    // Buffer is always pre-filled with equilibrium, user overwrites what they want
-    buffer.copy_from_slice(&stream.silence_template);
+    // Pre-fill buffer with equilibrium; user callback overwrites what it wants.
+    stream.equilibrium.fill(buffer);
     {
         let data = buffer.as_mut_ptr() as *mut ();
         let mut data =
@@ -1094,10 +1132,11 @@ fn process_output(
         } else {
             stream_timestamp_fallback(stream.creation_instant)
         }?;
-        let delay_duration = frames_to_duration(delay_frames, stream.conf.sample_rate);
+        let delay_duration =
+            frames_to_duration(delay_frames as FrameCount, stream.conf.sample_rate);
         let playback = callback + delay_duration;
-        let timestamp = crate::OutputStreamTimestamp { callback, playback };
-        let info = crate::OutputCallbackInfo { timestamp };
+        let timestamp = OutputStreamTimestamp { callback, playback };
+        let info = OutputCallbackInfo { timestamp };
         data_callback(&mut data, &info);
     }
 
@@ -1191,15 +1230,6 @@ fn timespec_to_nanos(ts: libc::timespec) -> i64 {
 #[inline]
 fn timespec_diff_nanos(a: libc::timespec, b: libc::timespec) -> i64 {
     timespec_to_nanos(a) - timespec_to_nanos(b)
-}
-
-// Convert the given duration in frames at the given sample rate to a `std::time::Duration`.
-#[inline]
-fn frames_to_duration(frames: usize, rate: crate::SampleRate) -> std::time::Duration {
-    let secsf = frames as f64 / rate as f64;
-    let secs = secsf as u64;
-    let nanos = ((secsf - secs as f64) * 1_000_000_000.0) as u32;
-    std::time::Duration::new(secs, nanos)
 }
 
 impl Stream {

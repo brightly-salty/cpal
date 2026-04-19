@@ -7,10 +7,6 @@ use std::{
     time::Instant,
 };
 
-use crate::{
-    host::fill_with_equilibrium, traits::StreamTrait, Error, ErrorKind, InputCallbackInfo,
-    OutputCallbackInfo, SampleFormat, StreamConfig, StreamInstant,
-};
 use pipewire::{
     self as pw,
     context::ContextRc,
@@ -25,7 +21,12 @@ use pipewire::{
     stream::{StreamListener, StreamRc, StreamState},
 };
 
-use crate::Data;
+use crate::{
+    host::{equilibrium::fill_equilibrium, frames_to_duration},
+    traits::StreamTrait,
+    Data, Error, ErrorKind, FrameCount, InputCallbackInfo, InputStreamTimestamp,
+    OutputCallbackInfo, OutputStreamTimestamp, SampleFormat, StreamConfig, StreamInstant,
+};
 
 /// Counts the number of live [`PwInitGuard`] instances across all threads.
 static PW_INIT_COUNT: Mutex<usize> = Mutex::new(0);
@@ -80,7 +81,7 @@ impl Drop for Stream {
 }
 
 impl StreamTrait for Stream {
-    fn play(&self) -> Result<(), crate::Error> {
+    fn play(&self) -> Result<(), Error> {
         self.controller
             .send(StreamCommand::Toggle(true))
             .map_err(|_| {
@@ -91,7 +92,7 @@ impl StreamTrait for Stream {
             })?;
         Ok(())
     }
-    fn pause(&self) -> Result<(), crate::Error> {
+    fn pause(&self) -> Result<(), Error> {
         self.controller
             .send(StreamCommand::Toggle(false))
             .map_err(|_| {
@@ -103,11 +104,11 @@ impl StreamTrait for Stream {
         Ok(())
     }
 
-    fn now(&self) -> crate::StreamInstant {
+    fn now(&self) -> StreamInstant {
         monotonic_stream_instant().unwrap_or_else(|| stream_instant_from_start(self.start))
     }
 
-    fn buffer_size(&self) -> Result<crate::FrameCount, crate::Error> {
+    fn buffer_size(&self) -> Result<FrameCount, Error> {
         Ok(self.last_quantum.load(Ordering::Relaxed) as _)
     }
 }
@@ -248,12 +249,12 @@ where
                 let cb = monotonic_stream_instant()
                     .unwrap_or_else(|| stream_instant_from_start(self.start));
                 let capture = cb
-                    .checked_sub(frames_to_duration(frames, self.format.rate()))
-                    .unwrap_or(crate::StreamInstant::ZERO);
+                    .checked_sub(frames_to_duration(frames as FrameCount, self.format.rate()))
+                    .unwrap_or(StreamInstant::ZERO);
                 (cb, capture)
             }
         };
-        let timestamp = crate::InputStreamTimestamp { callback, capture };
+        let timestamp = InputStreamTimestamp { callback, capture };
         let info = InputCallbackInfo { timestamp };
         (self.data_callback)(data, &info);
     }
@@ -273,11 +274,11 @@ where
             None => {
                 let cb = monotonic_stream_instant()
                     .unwrap_or_else(|| stream_instant_from_start(self.start));
-                let pl = cb + frames_to_duration(frames, self.format.rate());
+                let pl = cb + frames_to_duration(frames as FrameCount, self.format.rate());
                 (cb, pl)
             }
         };
-        let timestamp = crate::OutputStreamTimestamp { callback, playback };
+        let timestamp = OutputStreamTimestamp { callback, playback };
         let info = OutputCallbackInfo { timestamp };
         (self.data_callback)(data, &info);
     }
@@ -311,15 +312,6 @@ fn monotonic_stream_instant() -> Option<StreamInstant> {
     } else {
         None
     }
-}
-
-// Convert the given duration in frames at the given sample rate to a `std::time::Duration`.
-#[inline]
-fn frames_to_duration(frames: usize, rate: crate::SampleRate) -> std::time::Duration {
-    let secsf = frames as f64 / rate as f64;
-    let secs = secsf as u64;
-    let nanos = ((secsf - secs as f64) * 1_000_000_000.0) as u32;
-    std::time::Duration::new(secs, nanos)
 }
 
 fn remote_props() -> Option<pw::properties::PropertiesBox> {
@@ -433,10 +425,10 @@ where
                 // samples = frames * channels or samples = data_len / sample_size
                 let n_samples = frames * n_channels as usize;
 
-                // Pre-fill only the active region with silence before handing it to the
+                // Pre-fill only the active region with equilibrium before handing it to the
                 // callback.
                 let active = &mut samples[..frames * stride];
-                fill_with_equilibrium(active, user_data.sample_format);
+                fill_equilibrium(active, user_data.sample_format);
 
                 let data = active.as_mut_ptr() as *mut ();
                 let mut data =

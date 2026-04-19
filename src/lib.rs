@@ -164,9 +164,6 @@ extern crate wasm_bindgen;
 #[cfg(all(target_arch = "wasm32", feature = "wasm-bindgen"))]
 extern crate web_sys;
 
-#[cfg(all(target_arch = "wasm32", feature = "wasm-bindgen"))]
-use wasm_bindgen::prelude::*;
-
 pub use device_description::{
     DeviceDescription, DeviceDescriptionBuilder, DeviceDirection, DeviceType, InterfaceType,
 };
@@ -175,13 +172,15 @@ pub use platform::{
     available_hosts, default_host, host_from_id, Device, Devices, Host, HostId, Stream,
     SupportedInputConfigs, SupportedOutputConfigs, ALL_HOSTS,
 };
-pub use samples_formats::{FromSample, Sample, SampleFormat, SizedSample, I24, U24};
+pub use sample_format::{FromSample, Sample, SampleFormat, SizedSample, I24, U24};
+#[cfg(all(target_arch = "wasm32", feature = "wasm-bindgen"))]
+use wasm_bindgen::prelude::*;
 
 pub mod device_description;
 mod error;
 mod host;
 pub mod platform;
-mod samples_formats;
+mod sample_format;
 mod timestamp;
 pub mod traits;
 
@@ -271,7 +270,7 @@ impl std::str::FromStr for DeviceId {
 
         let host_id = crate::platform::HostId::from_str(host_str)?;
 
-        Ok(DeviceId(host_id, device_str.to_string()))
+        Ok(Self(host_id, device_str.to_string()))
     }
 }
 
@@ -510,7 +509,7 @@ impl Data {
     /// - The `sample_format` must correctly represent the underlying sample data delivered/expected
     ///   by the stream.
     pub unsafe fn from_parts(data: *mut (), len: usize, sample_format: SampleFormat) -> Self {
-        Data {
+        Self {
             data,
             len,
             sample_format,
@@ -691,6 +690,7 @@ impl SupportedStreamConfigRange {
     /// - Max sample rate
     pub fn cmp_default_heuristics(&self, other: &Self) -> std::cmp::Ordering {
         use std::cmp::Ordering::Equal;
+
         use SampleFormat::{F32, I16, I24, I32, U16, U24, U32};
 
         let cmp_stereo = (self.channels == 2).cmp(&(other.channels == 2));

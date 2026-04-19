@@ -1,23 +1,15 @@
-pub use crate::iter::{SupportedInputConfigs, SupportedOutputConfigs};
+use std::{
+    hash::{Hash, Hasher},
+    sync::{atomic::AtomicU32, Arc, Mutex},
+};
 
 use super::sys;
-use crate::host::com;
-use crate::ChannelCount;
-use crate::DeviceDescription;
-use crate::DeviceDescriptionBuilder;
-use crate::DeviceId;
-use crate::Error;
-use crate::ErrorKind;
-use crate::FrameCount;
-use crate::SampleFormat;
-use crate::SampleRate;
-use crate::SupportedBufferSize;
-use crate::SupportedStreamConfig;
-use crate::SupportedStreamConfigRange;
-
-use std::hash::{Hash, Hasher};
-use std::sync::atomic::AtomicU32;
-use std::sync::{Arc, Mutex};
+pub use crate::iter::{SupportedInputConfigs, SupportedOutputConfigs};
+use crate::{
+    host::com, ChannelCount, DeviceDescription, DeviceDescriptionBuilder, DeviceId, Error,
+    ErrorKind, FrameCount, SampleFormat, SampleRate, SupportedBufferSize, SupportedStreamConfig,
+    SupportedStreamConfigRange,
+};
 
 /// A ASIO Device
 #[derive(Clone)]
@@ -167,7 +159,7 @@ impl Iterator for Devices {
     type Item = Device;
 
     /// Enumerate devices by briefly loading each driver to capture its metadata.
-    fn next(&mut self) -> Option<Device> {
+    fn next(&mut self) -> Option<Self::Item> {
         // Drop the previously loaded driver before attempting to load the next one.
         self.current_driver = None;
 
