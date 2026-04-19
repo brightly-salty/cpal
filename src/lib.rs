@@ -73,7 +73,8 @@
 //!     move |err| {
 //!         // react to errors here.
 //!     },
-//!     None // None=blocking, Some(Duration)=timeout
+//!     None // Timeout for stream initialization: None = wait indefinitely,
+//!          // Some(Duration) = time to wait for the backend to initialize the stream.
 //! );
 //! ```
 //!

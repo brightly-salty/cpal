@@ -223,8 +223,9 @@ pub trait DeviceTrait {
     /// * `data_callback` - Called periodically with captured audio data. The callback receives
     ///   a slice of samples in the format `T` and timing information.
     /// * `error_callback` - Called when a stream error occurs (e.g., device disconnected).
-    /// * `timeout` - Optional timeout for backend operations. `None` indicates blocking behavior,
-    ///   `Some(duration)` sets a maximum wait time. Not all backends support timeouts.
+    /// * `timeout` - Time to wait for the backend to initialize the stream. `None` waits
+    ///   indefinitely; `Some(duration)` limits how long to wait. Note: not all backends honor
+    ///   this value.
     ///
     /// # Errors
     ///
@@ -278,8 +279,9 @@ pub trait DeviceTrait {
     ///   a mutable slice of samples in the format `T` to be filled with audio data, along with
     ///   timing information.
     /// * `error_callback` - Called when a stream error occurs (e.g., device disconnected).
-    /// * `timeout` - Optional timeout for backend operations. `None` indicates blocking behavior,
-    ///   `Some(duration)` sets a maximum wait time. Not all backends support timeouts.
+    /// * `timeout` - Time to wait for the backend to initialize the stream. `None` waits
+    ///   indefinitely; `Some(duration)` limits how long to wait. Note: not all backends honor
+    ///   this value.
     ///
     /// # Errors
     ///
@@ -336,8 +338,9 @@ pub trait DeviceTrait {
     /// * `sample_format` - The sample format of the audio data.
     /// * `data_callback` - Called periodically with captured audio data as a [`Data`] buffer.
     /// * `error_callback` - Called when a stream error occurs (e.g., device disconnected).
-    /// * `timeout` - Optional timeout for backend operations. `None` indicates blocking behavior,
-    ///   `Some(duration)` sets a maximum wait time. Not all backends support timeouts.
+    /// * `timeout` - Time to wait for the backend to initialize the stream. `None` waits
+    ///   indefinitely; `Some(duration)` limits how long to wait. Note: not all backends honor
+    ///   this value.
     ///
     /// # Errors
     ///
@@ -380,8 +383,9 @@ pub trait DeviceTrait {
     /// * `data_callback` - Called periodically to fill the output buffer with audio data as
     ///   a mutable [`Data`] buffer.
     /// * `error_callback` - Called when a stream error occurs (e.g., device disconnected).
-    /// * `timeout` - Optional timeout for backend operations. `None` indicates blocking behavior,
-    ///   `Some(duration)` sets a maximum wait time. Not all backends support timeouts.
+    /// * `timeout` - Time to wait for the backend to initialize the stream. `None` waits
+    ///   indefinitely; `Some(duration)` limits how long to wait. Note: not all backends honor
+    ///   this value.
     ///
     /// # Errors
     ///
