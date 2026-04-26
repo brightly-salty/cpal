@@ -15,6 +15,8 @@ This guide covers breaking changes requiring code updates. See [CHANGELOG.md](CH
 - [ ] Update `StreamInstant::from_nanos(nanos)` call sites: `nanos` is now `u64`.
 - [ ] Update `duration_since` call sites to pass by value (drop the `&`).
 - [ ] Migrate `wasm32-unknown-emscripten` to `wasm32-unknown-unknown` if possible.
+- [ ] If you relied on the default config returning 44.1 kHz, pin the sample rate explicitly.
+- [ ] If you relied on the default config returning `F32`, pin the sample format explicitly.
 
 ## 1. Unified `Error` and `ErrorKind` type
 
@@ -151,7 +153,48 @@ StreamInstant::new(0_u64, 0);
 
 **Why:** All audio host clocks are positive and monotonic; they are never negative.
 
-## 4. `wasm32-unknown-emscripten` target removed
+## 4. Default sample rate changed to 48 kHz
+
+**What changed:** `default_input_config()` and `default_output_config()` now prefer 48 kHz over
+44.1 kHz on backends that apply a heuristic. The new selection order is 48 kHz, then 44.1 kHz, then the device maximum.
+
+If your pipeline requires 44.1 kHz, request it explicitly:
+
+```rust
+let config = device
+    .supported_output_configs()?
+    .find_map(|r| r.try_with_sample_rate(cpal::SAMPLE_RATE_CD))
+    .expect("device does not support 44.1 kHz");
+```
+
+**Why:** 48 kHz is the native rate of virtually all modern hardware; the old default caused
+unnecessary resampling on such devices.
+
+## 5. Default sample format selection changed
+
+**What changed:** `default_input_config()` and `default_output_config()` now use a fully-ranked
+format ordering across all `SampleFormat` variants.
+
+Previously only `F32`, `I16`, and `U16` were explicitly ranked; all other formats compared as
+equal. On hosts that expose higher-precision formats, the default config may now return a
+different format than before. Likely candidates are `I32`, `I24`, or even `F64` if the device 
+or plugin supports it.
+
+If your code assumes the default format is `F32`, request the format explicitly:
+
+```rust
+// Request F32 explicitly instead of relying on the default
+let configs = device
+    .supported_output_configs()?
+    .filter(|r| r.sample_format() == SampleFormat::F32);
+```
+
+**Why:** The previous heuristic only explicitly ranked three formats, making selection
+unpredictable for any other format the device reported. The new ordering is complete and
+consistent: floats before integers (F64 > F32 for maximum fidelity), integers by bit-depth
+descending with signed above unsigned at each width, and DSD last.
+
+## 6. `wasm32-unknown-emscripten` target removed
 
 **What changed:** The `emscripten` audio host and the `wasm32-unknown-emscripten` build target are no longer supported.
 
