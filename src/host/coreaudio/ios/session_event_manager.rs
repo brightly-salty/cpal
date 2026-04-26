@@ -26,8 +26,12 @@ unsafe fn route_change_error(notification: &NSNotification) -> Option<Error> {
     let number = value.downcast_ref::<NSNumber>()?;
     let reason = AVAudioSessionRouteChangeReason(number.unsignedIntegerValue());
     match reason {
-        AVAudioSessionRouteChangeReason::OldDeviceUnavailable
-        | AVAudioSessionRouteChangeReason::CategoryChange
+        AVAudioSessionRouteChangeReason::OldDeviceUnavailable => Some(Error::with_message(
+            ErrorKind::DeviceChanged,
+            "audio route changed",
+        )),
+
+        AVAudioSessionRouteChangeReason::CategoryChange
         | AVAudioSessionRouteChangeReason::Override
         | AVAudioSessionRouteChangeReason::RouteConfigurationChange => Some(Error::with_message(
             ErrorKind::StreamInvalidated,

@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - `ErrorKind::DeviceBusy` for retryable device access errors (e.g. EBUSY, EAGAIN).
+- `ErrorKind::DeviceChanged` signals that the audio route changed to another device.
 - `ErrorKind::PermissionDenied` for OS-level access denials.
 - `ErrorKind::ThreadPriorityUnavailable` for when a thread priority request is not granted.
 - `StreamConfig` now implements `Copy`.
@@ -60,6 +61,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   rate change on macOS, and on iOS on route changes that require a stream rebuild.
 - **CoreAudio**: Stream error callback now receives `ErrorKind::DeviceNotAvailable` on iOS
   when media services are lost.
+- **CoreAudio**: Default output streams now receive `ErrorKind::DeviceChanged` when the system
+  default output device changes.
+- **CoreAudio**: On iOS, unplugging headphones now emits `ErrorKind::DeviceChanged` (stream
+  rerouted to speaker).
 - **CoreAudio**: User timeouts are now respected when building a stream.
 - **JACK**: Timestamps now use the precise hardware deadline.
 - **JACK**: Buffer size change no longer fires an error callback; internal buffers are resized
@@ -109,6 +114,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   update.
 - **ASIO**: Poisoned stream locks now return `ErrorKind::StreamInvalidated` instead of panicking.
 - **ASIO**: Output buffers are now zero-filled before the callback runs.
+- **CoreAudio**: Fix default output streams silently stopping when the system default output
+  device is unplugged; they now reroute automatically or report `ErrorKind::DeviceNotAvailable`.
 - **CoreAudio**: Fix undefined behaviour and silent failure in loopback device creation.
 - **CoreAudio**: Poisoned stream locks now return `ErrorKind::StreamInvalidated` instead of 
   panicking.
