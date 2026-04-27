@@ -204,7 +204,7 @@ pub type SampleRate = u32;
 pub const SAMPLE_RATE_CD: SampleRate = 44_100;
 
 /// 48 kHz: the EBU/SMPTE broadcast standard, default on most modern hardware.
-pub const SAMPLE_RATE_BROADCAST: SampleRate = 48_000;
+pub const SAMPLE_RATE_48K: SampleRate = 48_000;
 
 /// A frame represents one sample for each channel. For example, with stereo audio,
 /// one frame contains two samples (left and right channels).
@@ -685,7 +685,7 @@ impl SupportedStreamConfigRange {
     /// Returns `None` if neither standard rate falls within the range specified within this
     /// [`SupportedStreamConfigRange`] instance.
     pub fn try_with_standard_sample_rate(self) -> Option<SupportedStreamConfig> {
-        for rate in [SAMPLE_RATE_BROADCAST, SAMPLE_RATE_CD] {
+        for rate in [SAMPLE_RATE_48K, SAMPLE_RATE_CD] {
             if self.contains_rate(rate) {
                 return Some(self.with_sample_rate(rate));
             }
@@ -777,8 +777,8 @@ impl SupportedStreamConfigRange {
         }
 
         let cmp_broadcast = self
-            .contains_rate(SAMPLE_RATE_BROADCAST)
-            .cmp(&other.contains_rate(SAMPLE_RATE_BROADCAST));
+            .contains_rate(SAMPLE_RATE_48K)
+            .cmp(&other.contains_rate(SAMPLE_RATE_48K));
         if cmp_broadcast != Equal {
             return cmp_broadcast;
         }
@@ -816,7 +816,7 @@ fn test_with_standard_sample_rate() {
 
     assert_eq!(
         r(1, 96_000).with_standard_sample_rate().sample_rate(),
-        SAMPLE_RATE_BROADCAST
+        SAMPLE_RATE_48K
     );
     assert_eq!(
         r(1, 44_100).with_standard_sample_rate().sample_rate(),
@@ -839,7 +839,7 @@ fn test_try_with_standard_sample_rate() {
         r(1, 96_000)
             .try_with_standard_sample_rate()
             .map(|c| c.sample_rate()),
-        Some(SAMPLE_RATE_BROADCAST)
+        Some(SAMPLE_RATE_48K)
     );
 
     // 48 kHz not available but 44.1 kHz is; second choice

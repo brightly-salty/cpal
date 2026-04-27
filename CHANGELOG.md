@@ -18,7 +18,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `HostTrait::device_by_id()` is now dispatched to each backend's implementation, allowing
   backends to override it.
 - `StreamTrait::now()` to query the current instant on the stream's clock.
-- `SAMPLE_RATE_CD` (44100 Hz) and `SAMPLE_RATE_BROADCAST` (48000 Hz) constants.
+- `SAMPLE_RATE_CD` (44100 Hz) and `SAMPLE_RATE_48K` (48000 Hz) constants.
 - `SupportedStreamConfigRange::contains_rate()` to test whether a sample rate falls within a range.
 - `SupportedStreamConfigRange::try_with_standard_sample_rate()` and `with_standard_sample_rate()`
   to select 48 kHz or 44.1 kHz from a range.
