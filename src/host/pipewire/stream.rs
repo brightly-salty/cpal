@@ -1,6 +1,8 @@
 use std::{
+    cell::RefCell,
+    rc::Rc,
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Mutex,
     },
     thread::JoinHandle,
@@ -10,7 +12,10 @@ use std::{
 use pipewire::{
     self as pw,
     context::ContextRc,
+    core::Listener as CoreListener,
     main_loop::MainLoopRc,
+    metadata::{Metadata, MetadataListener},
+    registry::{Listener as RegistryListener, RegistryRc},
     spa::{
         param::{
             format::{MediaSubtype, MediaType},
@@ -22,7 +27,7 @@ use pipewire::{
 };
 
 use crate::{
-    host::{equilibrium::fill_equilibrium, frames_to_duration},
+    host::{emit_error, equilibrium::fill_equilibrium, frames_to_duration, try_emit_error},
     traits::StreamTrait,
     Data, Error, ErrorKind, FrameCount, InputCallbackInfo, InputStreamTimestamp,
     OutputCallbackInfo, OutputStreamTimestamp, SampleFormat, StreamConfig, StreamInstant,
@@ -175,28 +180,45 @@ impl From<SampleFormat> for pw::spa::param::audio::AudioFormat {
     }
 }
 
-pub struct UserData<D, E> {
+type ErrorCallback = Arc<Mutex<Box<dyn FnMut(Error) + Send + 'static>>>;
+
+pub struct UserData<D> {
     data_callback: D,
-    error_callback: E,
+    error_callback: ErrorCallback,
     sample_format: SampleFormat,
     format: pw::spa::param::audio::AudioInfoRaw,
     last_quantum: Arc<AtomicU64>,
     start: Instant,
+    is_default_device: bool,
+    has_connected: bool,
+    invalidated: Arc<AtomicBool>,
 }
-impl<D, E> UserData<D, E>
-where
-    E: FnMut(Error) + Send + 'static,
-{
+
+impl<D> UserData<D> {
     fn state_changed(&mut self, new: StreamState) {
         match new {
-            pipewire::stream::StreamState::Error(e) => {
-                (self.error_callback)(Error::with_message(ErrorKind::StreamInvalidated, e))
+            StreamState::Streaming => self.has_connected = true,
+            StreamState::Unconnected => {
+                // Let the metadata monitor fire for default-device streams
+                if self.has_connected
+                    && !self.is_default_device
+                    && !self.invalidated.swap(true, Ordering::Relaxed)
+                {
+                    emit_error(
+                        &self.error_callback,
+                        Error::with_message(ErrorKind::DeviceNotAvailable, "device disconnected"),
+                    );
+                }
             }
-            // TODO: maybe we need to log information when every new state comes?
-            pipewire::stream::StreamState::Paused => {}
-            pipewire::stream::StreamState::Streaming => {}
-            pipewire::stream::StreamState::Connecting => {}
-            pipewire::stream::StreamState::Unconnected => {}
+            StreamState::Error(e) => {
+                if !self.invalidated.swap(true, Ordering::Relaxed) {
+                    emit_error(
+                        &self.error_callback,
+                        Error::with_message(ErrorKind::StreamInvalidated, e),
+                    );
+                }
+            }
+            StreamState::Paused | StreamState::Connecting => {}
         }
     }
 }
@@ -233,10 +255,9 @@ fn pw_stream_time(stream: &pw::stream::Stream) -> Option<PwTime> {
     })
 }
 
-impl<D, E> UserData<D, E>
+impl<D> UserData<D>
 where
     D: FnMut(&Data, &InputCallbackInfo) + Send + 'static,
-    E: FnMut(Error) + Send + 'static,
 {
     fn publish_data_in(&mut self, stream: &pw::stream::Stream, frames: usize, data: &Data) {
         self.last_quantum.store(frames as u64, Ordering::Relaxed);
@@ -259,10 +280,10 @@ where
         (self.data_callback)(data, &info);
     }
 }
-impl<D, E> UserData<D, E>
+
+impl<D> UserData<D>
 where
     D: FnMut(&mut Data, &OutputCallbackInfo) + Send + 'static,
-    E: FnMut(Error) + Send + 'static,
 {
     fn publish_data_out(&mut self, stream: &pw::stream::Stream, frames: usize, data: &mut Data) {
         self.last_quantum.store(frames as u64, Ordering::Relaxed);
@@ -283,11 +304,14 @@ where
         (self.data_callback)(data, &info);
     }
 }
-pub struct StreamData<D, E> {
+
+pub struct StreamData<D> {
     pub mainloop: MainLoopRc,
-    pub listener: StreamListener<UserData<D, E>>,
+    pub listener: StreamListener<UserData<D>>,
     pub stream: StreamRc,
     pub context: ContextRc,
+    pub default_monitor: Option<DefaultDeviceMonitor>,
+    pub core_monitor: CoreListener,
 }
 
 /// Fallback timestamp using elapsed time since stream creation.
@@ -321,22 +345,156 @@ fn remote_props() -> Option<pw::properties::PropertiesBox> {
     Some(props)
 }
 
+/// Holds the metadata proxy and its listener alive for the duration of the stream, so that
+/// default-device changes are delivered via `error_callback`.
+struct MetadataObjects {
+    _listener: MetadataListener,
+    _metadata: Metadata,
+}
+
+pub struct DefaultDeviceMonitor {
+    _registry: RegistryRc,
+    _registry_listener: RegistryListener,
+    _meta_objects: Rc<RefCell<Option<MetadataObjects>>>,
+}
+
+impl DefaultDeviceMonitor {
+    /// Subscribe to the `"default"` metadata object and fire `error_callback` with
+    /// [`ErrorKind::DeviceChanged`] whenever its key changes.
+    fn new(
+        registry: RegistryRc,
+        key: &'static str,
+        error_callback: ErrorCallback,
+        invalidated: Arc<AtomicBool>,
+    ) -> Self {
+        let meta_objects: Rc<RefCell<Option<MetadataObjects>>> = Rc::new(RefCell::new(None));
+        let meta_objects_ref = meta_objects.clone();
+        let registry_ref = registry.clone();
+
+        let registry_listener = registry
+            .add_listener_local()
+            .global(move |global| {
+                if global.type_ != pipewire::types::ObjectType::Metadata {
+                    return;
+                }
+                if !global.props.is_some_and(|props| {
+                    props
+                        .get(super::utils::METADATA_NAME)
+                        .is_some_and(|v| v == super::utils::default::NAME)
+                }) {
+                    return;
+                }
+                let metadata: Metadata = match registry_ref.bind(global) {
+                    Ok(m) => m,
+                    Err(_) => return,
+                };
+                let error_callback_cb = error_callback.clone();
+                let invalidated_cb = invalidated.clone();
+
+                let last_value: RefCell<Option<Option<String>>> = RefCell::new(None);
+                let listener = metadata
+                    .add_listener_local()
+                    .property(move |_subject, prop_key, _type, value| {
+                        if prop_key == Some(key) {
+                            let prev = last_value.borrow_mut().replace(value.map(str::to_owned));
+                            if let Some(old) = prev {
+                                if old.as_deref() != value {
+                                    if value.is_some() {
+                                        try_emit_error(
+                                            &error_callback_cb,
+                                            Error::with_message(
+                                                ErrorKind::DeviceChanged,
+                                                "default device changed",
+                                            ),
+                                        );
+                                    } else if !invalidated_cb.swap(true, Ordering::Relaxed) {
+                                        emit_error(
+                                            &error_callback_cb,
+                                            Error::with_message(
+                                                ErrorKind::DeviceNotAvailable,
+                                                "default device removed",
+                                            ),
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                        0
+                    })
+                    .register();
+                *meta_objects_ref.borrow_mut() = Some(MetadataObjects {
+                    _listener: listener,
+                    _metadata: metadata,
+                });
+            })
+            .register();
+
+        DefaultDeviceMonitor {
+            _registry: registry,
+            _registry_listener: registry_listener,
+            _meta_objects: meta_objects,
+        }
+    }
+}
+
+pub struct ConnectParams {
+    pub config: StreamConfig,
+    pub properties: pw::properties::PropertiesBox,
+    pub sample_format: SampleFormat,
+    pub last_quantum: Arc<AtomicU64>,
+    pub start: Instant,
+    pub default_metadata_key: Option<&'static str>,
+}
+
 pub fn connect_output<D, E>(
-    config: StreamConfig,
-    properties: pw::properties::PropertiesBox,
-    sample_format: SampleFormat,
+    params: ConnectParams,
     data_callback: D,
     error_callback: E,
-    last_quantum: Arc<AtomicU64>,
-    start: Instant,
-) -> Result<StreamData<D, E>, pw::Error>
+) -> Result<StreamData<D>, pw::Error>
 where
     D: FnMut(&mut Data, &OutputCallbackInfo) + Send + 'static,
     E: FnMut(Error) + Send + 'static,
 {
+    let ConnectParams {
+        config,
+        properties,
+        sample_format,
+        last_quantum,
+        start,
+        default_metadata_key,
+    } = params;
+
     let mainloop = pw::main_loop::MainLoopRc::new(None)?;
     let context = pw::context::ContextRc::new(&mainloop, None)?;
     let core = context.connect_rc(remote_props())?;
+
+    let error_callback: ErrorCallback = Arc::new(Mutex::new(Box::new(error_callback)));
+    let invalidated = Arc::new(AtomicBool::new(false));
+
+    let default_monitor = default_metadata_key.and_then(|key| {
+        core.get_registry_rc().ok().map(|registry| {
+            DefaultDeviceMonitor::new(registry, key, error_callback.clone(), invalidated.clone())
+        })
+    });
+    let is_default = default_monitor.is_some();
+
+    let core_monitor = {
+        let invalidated_core = invalidated.clone();
+        let error_callback_core = error_callback.clone();
+        core.add_listener_local()
+            .error(move |id, _seq, _res, message| {
+                if id == pw::core::PW_ID_CORE && !invalidated_core.swap(true, Ordering::Relaxed) {
+                    emit_error(
+                        &error_callback_core,
+                        Error::with_message(
+                            ErrorKind::StreamInvalidated,
+                            format!("PipeWire server error: {message}"),
+                        ),
+                    );
+                }
+            })
+            .register()
+    };
 
     let data = UserData {
         data_callback,
@@ -345,13 +503,16 @@ where
         format: Default::default(),
         last_quantum,
         start,
+        invalidated,
+        is_default_device: is_default,
+        has_connected: false,
     };
     let channels = config.channels as _;
     let rate = config.sample_rate as _;
     let stream = pw::stream::StreamRc::new(core, "cpal-playback", properties)?;
     let listener = stream
         .add_local_listener_with_user_data(data)
-        .param_changed(move|stream, user_data, id, param| {
+        .param_changed(move |stream, user_data, id, param| {
             let Some(param) = param else {
                 return;
             };
@@ -380,20 +541,24 @@ where
                 let mismatch = current_channels != channels
                     || current_rate != rate
                     || current_fmt != expected_fmt;
-                if mismatch {
-                    (user_data.error_callback)(Error::with_message(
-                        ErrorKind::UnsupportedConfig,
-                        format!("negotiated format mismatch: expected channels={channels} rate={rate} format={expected_fmt:?}, got channels={current_channels} rate={current_rate} format={current_fmt:?}"),
-                    ));
-                    // if the format does not match, we stop the stream
+                if mismatch && !user_data.invalidated.swap(true, Ordering::Relaxed) {
+                    emit_error(
+                        &user_data.error_callback,
+                        Error::with_message(
+                            ErrorKind::UnsupportedConfig,
+                            format!("negotiated format mismatch: expected channels={channels} rate={rate} format={expected_fmt:?}, got channels={current_channels} rate={current_rate} format={current_fmt:?}"),
+                        ),
+                    );
                     if let Err(e) = stream.set_active(false) {
-                        (user_data.error_callback)(Error::with_message(
-                            ErrorKind::StreamInvalidated,
-                            format!("failed to stop the stream, reason: {e}"),
-                        ));
+                        emit_error(
+                            &user_data.error_callback,
+                            Error::with_message(
+                                ErrorKind::StreamInvalidated,
+                                format!("failed to stop the stream, reason: {e}"),
+                            ),
+                        );
                     }
                 }
-
             }
         })
         .state_changed(|_stream, user_data, _old, new| {
@@ -477,24 +642,60 @@ where
         listener,
         stream,
         context,
+        default_monitor,
+        core_monitor,
     })
 }
+
 pub fn connect_input<D, E>(
-    config: StreamConfig,
-    properties: pw::properties::PropertiesBox,
-    sample_format: SampleFormat,
+    params: ConnectParams,
     data_callback: D,
     error_callback: E,
-    last_quantum: Arc<AtomicU64>,
-    start: Instant,
-) -> Result<StreamData<D, E>, pw::Error>
+) -> Result<StreamData<D>, pw::Error>
 where
     D: FnMut(&Data, &InputCallbackInfo) + Send + 'static,
     E: FnMut(Error) + Send + 'static,
 {
+    let ConnectParams {
+        config,
+        properties,
+        sample_format,
+        last_quantum,
+        start,
+        default_metadata_key,
+    } = params;
+
     let mainloop = pw::main_loop::MainLoopRc::new(None)?;
     let context = pw::context::ContextRc::new(&mainloop, None)?;
     let core = context.connect_rc(remote_props())?;
+
+    let error_callback: ErrorCallback = Arc::new(Mutex::new(Box::new(error_callback)));
+    let invalidated = Arc::new(AtomicBool::new(false));
+
+    let default_monitor = default_metadata_key.and_then(|key| {
+        core.get_registry_rc().ok().map(|registry| {
+            DefaultDeviceMonitor::new(registry, key, error_callback.clone(), invalidated.clone())
+        })
+    });
+    let is_default = default_monitor.is_some();
+
+    let core_monitor = {
+        let invalidated_core = invalidated.clone();
+        let error_callback_core = error_callback.clone();
+        core.add_listener_local()
+            .error(move |id, _seq, _res, message| {
+                if id == pw::core::PW_ID_CORE && !invalidated_core.swap(true, Ordering::Relaxed) {
+                    emit_error(
+                        &error_callback_core,
+                        Error::with_message(
+                            ErrorKind::StreamInvalidated,
+                            format!("PipeWire server error: {message}"),
+                        ),
+                    );
+                }
+            })
+            .register()
+    };
 
     let data = UserData {
         data_callback,
@@ -503,6 +704,9 @@ where
         format: Default::default(),
         last_quantum,
         start,
+        invalidated,
+        is_default_device: is_default,
+        has_connected: false,
     };
 
     let channels = config.channels as _;
@@ -541,17 +745,22 @@ where
                 let mismatch = current_channels != channels
                     || current_rate != rate
                     || current_fmt != expected_fmt;
-                if mismatch {
-                    (user_data.error_callback)(Error::with_message(
-                        ErrorKind::UnsupportedConfig,
-                        format!("negotiated format mismatch: expected channels={channels} rate={rate} format={expected_fmt:?}, got channels={current_channels} rate={current_rate} format={current_fmt:?}"),
-                    ));
-                    // if the format does not match, we stop the stream
+                if mismatch && !user_data.invalidated.swap(true, Ordering::Relaxed) {
+                    emit_error(
+                        &user_data.error_callback,
+                        Error::with_message(
+                            ErrorKind::UnsupportedConfig,
+                            format!("negotiated format mismatch: expected channels={channels} rate={rate} format={expected_fmt:?}, got channels={current_channels} rate={current_rate} format={current_fmt:?}"),
+                        ),
+                    );
                     if let Err(e) = stream.set_active(false) {
-                        (user_data.error_callback)(Error::with_message(
-                            ErrorKind::StreamInvalidated,
-                            format!("failed to stop the stream, reason: {e}"),
-                        ));
+                        emit_error(
+                            &user_data.error_callback,
+                            Error::with_message(
+                                ErrorKind::StreamInvalidated,
+                                format!("failed to stop the stream, reason: {e}"),
+                            ),
+                        );
                     }
                 }
             }
@@ -619,5 +828,7 @@ where
         listener,
         stream,
         context,
+        default_monitor,
+        core_monitor,
     })
 }

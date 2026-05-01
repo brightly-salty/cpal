@@ -128,6 +128,96 @@ pub(crate) mod custom;
 )))]
 pub(crate) mod null;
 
+/// Deliver an error that the app must not miss, blocking if the callback is currently
+/// executing on another thread. Use this for fatal or actionable errors.
+#[cfg(any(
+    target_vendor = "apple",
+    all(
+        feature = "jack",
+        any(
+            target_os = "linux",
+            target_os = "dragonfly",
+            target_os = "freebsd",
+            target_os = "netbsd",
+            target_os = "macos",
+            target_os = "windows",
+        )
+    ),
+    all(
+        feature = "pipewire",
+        any(
+            target_os = "linux",
+            target_os = "dragonfly",
+            target_os = "freebsd",
+            target_os = "netbsd",
+        )
+    ),
+    all(
+        feature = "pulseaudio",
+        any(
+            target_os = "linux",
+            target_os = "dragonfly",
+            target_os = "freebsd",
+            target_os = "netbsd",
+        )
+    ),
+))]
+pub(crate) fn emit_error<E>(callback: &std::sync::Arc<std::sync::Mutex<E>>, error: crate::Error)
+where
+    E: FnMut(crate::Error) + Send + ?Sized,
+{
+    let mut cb = callback.lock().unwrap_or_else(|e| e.into_inner());
+    cb(error);
+}
+
+/// Try to deliver an error without blocking the caller.
+///
+/// Silently drops the error if the callback is currently executing on another thread.
+/// Use this only for non-fatal notifications where missing one occurrence is acceptable
+/// and blocking a real-time thread is not.
+#[cfg(any(
+    target_vendor = "apple",
+    all(
+        feature = "jack",
+        any(
+            target_os = "linux",
+            target_os = "dragonfly",
+            target_os = "freebsd",
+            target_os = "netbsd",
+            target_os = "macos",
+            target_os = "windows",
+        )
+    ),
+    all(
+        feature = "pipewire",
+        any(
+            target_os = "linux",
+            target_os = "dragonfly",
+            target_os = "freebsd",
+            target_os = "netbsd",
+        )
+    ),
+    all(
+        feature = "pulseaudio",
+        any(
+            target_os = "linux",
+            target_os = "dragonfly",
+            target_os = "freebsd",
+            target_os = "netbsd",
+        )
+    ),
+))]
+pub(crate) fn try_emit_error<E>(callback: &std::sync::Arc<std::sync::Mutex<E>>, error: crate::Error)
+where
+    E: FnMut(crate::Error) + Send + ?Sized,
+{
+    match callback.try_lock() {
+        Ok(mut cb) => cb(error),
+        Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner()(error),
+        Err(std::sync::TryLockError::WouldBlock) => {}
+    }
+}
+
 /// Convert a frame count at a given sample rate to a [`std::time::Duration`].
 #[cfg(any(
     target_os = "linux",

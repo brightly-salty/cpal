@@ -17,7 +17,7 @@ use pipewire::{
 use super::stream::Stream;
 use crate::{
     host::pipewire::stream::{PwInitGuard, StreamCommand, StreamData, SUPPORTED_FORMATS},
-    host::pipewire::utils::{audio, clock, node, DEVICE_ICON_NAME, METADATA_NAME},
+    host::pipewire::utils::{audio, clock, default, node, DEVICE_ICON_NAME, METADATA_NAME},
     iter::{SupportedInputConfigs, SupportedOutputConfigs},
     traits::DeviceTrait,
     BufferSize, ChannelCount, Data, DeviceDescription, DeviceDescriptionBuilder, DeviceDirection,
@@ -117,6 +117,16 @@ impl Device {
             "audio-input-microphone" => DeviceType::Microphone,
             "audio-speakers" => DeviceType::Speaker,
             _ => DeviceType::Unknown,
+        }
+    }
+
+    /// Returns the WirePlumber metadata key to watch for default-device changes,
+    /// or `None` if this device is pinned to a specific node.
+    pub(crate) fn default_metadata_key(&self) -> Option<&'static str> {
+        match self.class {
+            Class::DefaultOutput | Class::DefaultSink => Some(default::SINK),
+            Class::DefaultInput => Some(default::SOURCE),
+            Class::Node => None,
         }
     }
 
@@ -319,14 +329,19 @@ impl DeviceTrait for Device {
                     listener,
                     stream,
                     context,
+                    default_monitor,
+                    core_monitor,
                 }) = super::stream::connect_input(
-                    config,
-                    properties,
-                    sample_format,
+                    super::stream::ConnectParams {
+                        config,
+                        properties,
+                        sample_format,
+                        last_quantum: last_quantum_clone,
+                        start,
+                        default_metadata_key: device.default_metadata_key(),
+                    },
                     data_callback,
                     error_callback,
-                    last_quantum_clone,
-                    start,
                 )
                 else {
                     let _ = pw_init_tx.send(false);
@@ -346,6 +361,8 @@ impl DeviceTrait for Device {
                 });
                 mainloop.run();
                 drop(listener);
+                drop(default_monitor);
+                drop(core_monitor);
                 drop(context);
             })
             .map_err(|e| {
@@ -404,14 +421,19 @@ impl DeviceTrait for Device {
                     listener,
                     stream,
                     context,
+                    default_monitor,
+                    core_monitor,
                 }) = super::stream::connect_output(
-                    config,
-                    properties,
-                    sample_format,
+                    super::stream::ConnectParams {
+                        config,
+                        properties,
+                        sample_format,
+                        last_quantum: last_quantum_clone,
+                        start,
+                        default_metadata_key: device.default_metadata_key(),
+                    },
                     data_callback,
                     error_callback,
-                    last_quantum_clone,
-                    start,
                 )
                 else {
                     let _ = pw_init_tx.send(false);
@@ -432,6 +454,8 @@ impl DeviceTrait for Device {
                 });
                 mainloop.run();
                 drop(listener);
+                drop(default_monitor);
+                drop(core_monitor);
                 drop(context);
             })
             .map_err(|e| {
@@ -847,7 +871,8 @@ fn parse_allow_rates(list: &str) -> Option<Vec<SampleRate>> {
 
 #[cfg(test)]
 mod test {
-    use super::{parse_allow_rates, parse_fraction};
+    use super::{parse_allow_rates, parse_fraction, Class, Device};
+    use crate::host::pipewire::utils::default;
 
     #[test]
     fn rate_parse() {
@@ -884,5 +909,27 @@ mod test {
         assert_eq!(parse_fraction("abc/def"), None);
         assert_eq!(parse_fraction("/48000"), None);
         assert_eq!(parse_fraction("256/"), None);
+    }
+
+    #[test]
+    fn default_metadata_key_mapping() {
+        assert_eq!(
+            Device::output_default().default_metadata_key(),
+            Some(default::SINK)
+        );
+        assert_eq!(
+            Device::sink_default().default_metadata_key(),
+            Some(default::SINK)
+        );
+        assert_eq!(
+            Device::input_default().default_metadata_key(),
+            Some(default::SOURCE)
+        );
+
+        let node = Device {
+            class: Class::Node,
+            ..Default::default()
+        };
+        assert_eq!(node.default_metadata_key(), None);
     }
 }
