@@ -304,7 +304,7 @@ struct StreamInner {
 }
 
 fn create_audio_unit() -> Result<AudioUnit, coreaudio::Error> {
-    AudioUnit::new(coreaudio::audio_unit::IOType::RemoteIO)
+    AudioUnit::new_uninitialized(coreaudio::audio_unit::IOType::RemoteIO)
 }
 
 fn configure_for_recording(audio_unit: &mut AudioUnit) -> Result<(), coreaudio::Error> {
@@ -423,9 +423,7 @@ fn setup_stream_audio_unit(
     let mut audio_unit = create_audio_unit()?;
 
     if is_input {
-        audio_unit.uninitialize()?;
         configure_for_recording(&mut audio_unit)?;
-        audio_unit.initialize()?;
     }
 
     // Set the stream format in interleaved mode
@@ -439,6 +437,8 @@ fn setup_stream_audio_unit(
 
     let asbd = asbd_from_config(config, sample_format);
     audio_unit.set_property(kAudioUnitProperty_StreamFormat, scope, element, Some(&asbd))?;
+
+    audio_unit.initialize()?;
 
     Ok(audio_unit)
 }

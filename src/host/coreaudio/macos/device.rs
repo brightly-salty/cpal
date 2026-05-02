@@ -15,15 +15,15 @@ use crate::{
 
 use coreaudio::audio_unit::audio_format::LinearPcmFlags;
 use coreaudio::audio_unit::macos_helpers::{
-    find_matching_physical_format, set_device_physical_stream_format, RateListener,
+    audio_unit_from_device_id_uninitialized, find_matching_physical_format,
+    set_device_physical_stream_format, RateListener,
 };
 use coreaudio::audio_unit::render_callback::{self, data};
 use coreaudio::audio_unit::{
     AudioUnit, Element, SampleFormat as CoreAudioSampleFormat, Scope, StreamFormat,
 };
 use objc2_audio_toolbox::{
-    kAudioOutputUnitProperty_CurrentDevice, kAudioOutputUnitProperty_EnableIO,
-    kAudioUnitProperty_StreamFormat,
+    kAudioOutputUnitProperty_CurrentDevice, kAudioUnitProperty_StreamFormat,
 };
 use objc2_core_audio::kAudioDevicePropertyDeviceUID;
 use objc2_core_audio::kAudioObjectPropertyElementMain;
@@ -230,29 +230,17 @@ fn audio_unit_from_device(
 ) -> Result<AudioUnit, coreaudio::Error> {
     match mode {
         AudioUnitMode::DefaultOutput => {
-            AudioUnit::new(coreaudio::audio_unit::IOType::DefaultOutput)
+            AudioUnit::new_uninitialized(coreaudio::audio_unit::IOType::DefaultOutput)
         }
-        AudioUnitMode::Input | AudioUnitMode::Output => {
-            let mut audio_unit = AudioUnit::new(coreaudio::audio_unit::IOType::HalOutput)?;
-
-            if matches!(mode, AudioUnitMode::Input) {
-                let enable_input = 1u32;
-                audio_unit.set_property(
-                    kAudioOutputUnitProperty_EnableIO,
-                    Scope::Input,
-                    Element::Input,
-                    Some(&enable_input),
-                )?;
-
-                let disable_output = 0u32;
-                audio_unit.set_property(
-                    kAudioOutputUnitProperty_EnableIO,
-                    Scope::Output,
-                    Element::Output,
-                    Some(&disable_output),
-                )?;
-            }
-
+        AudioUnitMode::Input => {
+            audio_unit_from_device_id_uninitialized(device.audio_device_id, true)
+        }
+        AudioUnitMode::Output => {
+            // Do not use audio_unit_from_device_id_uninitialized here: that function compares the
+            // device ID against the live system default and silently switches to DefaultOutput
+            // mode if they match. We explicitly pin HalOutput unit here.
+            let mut audio_unit =
+                AudioUnit::new_uninitialized(coreaudio::audio_unit::IOType::HalOutput)?;
             // Device selection is a device-level property:
             // always use Scope::Global + Element::Output
             audio_unit.set_property(
@@ -261,26 +249,36 @@ fn audio_unit_from_device(
                 Element::Output,
                 Some(&device.audio_device_id),
             )?;
-
             Ok(audio_unit)
         }
     }
 }
 
-fn get_io_buffer_frame_size_range(
-    audio_unit: &AudioUnit,
-) -> Result<SupportedBufferSize, coreaudio::Error> {
-    // Device-level property: always use Scope::Global + Element::Output
-    // regardless of whether this audio unit is configured for input or output
-    let buffer_size_range: AudioValueRange = audio_unit.get_property(
-        kAudioDevicePropertyBufferFrameSizeRange,
-        Scope::Global,
-        Element::Output,
-    )?;
-
+fn get_io_buffer_frame_size_range(device_id: AudioDeviceID) -> Result<SupportedBufferSize, Error> {
+    let property_address = AudioObjectPropertyAddress {
+        mSelector: kAudioDevicePropertyBufferFrameSizeRange,
+        mScope: kAudioObjectPropertyScopeGlobal,
+        mElement: kAudioObjectPropertyElementMaster,
+    };
+    // SAFETY: AudioObjectGetPropertyData writes exactly one AudioValueRange into the output
+    // pointer when querying kAudioDevicePropertyBufferFrameSizeRange. We verify the status
+    // before reading the value.
+    let mut range: AudioValueRange = unsafe { mem::zeroed() };
+    let mut data_size = mem::size_of::<AudioValueRange>() as u32;
+    let status = unsafe {
+        AudioObjectGetPropertyData(
+            device_id,
+            NonNull::from(&property_address),
+            0,
+            null(),
+            NonNull::from(&mut data_size),
+            NonNull::from(&mut range).cast(),
+        )
+    };
+    check_os_status(status)?;
     Ok(SupportedBufferSize::Range {
-        min: buffer_size_range.mMinimum as u32,
-        max: buffer_size_range.mMaximum as u32,
+        min: range.mMinimum as u32,
+        max: range.mMaximum as u32,
     })
 }
 
@@ -576,18 +574,16 @@ impl Device {
             ranges.set_len(n_ranges);
 
             #[allow(non_upper_case_globals)]
-            let mode = match scope {
-                kAudioObjectPropertyScopeInput => AudioUnitMode::Input,
-                kAudioObjectPropertyScopeOutput => AudioUnitMode::Output,
+            match scope {
+                kAudioObjectPropertyScopeInput | kAudioObjectPropertyScopeOutput => {}
                 _ => {
                     return Err(Error::with_message(
                         ErrorKind::UnsupportedOperation,
                         format!("unexpected scope (neither input nor output): {scope:?}"),
                     ))
                 }
-            };
-            let audio_unit = audio_unit_from_device(self, mode)?;
-            let buffer_size = get_io_buffer_frame_size_range(&audio_unit)?;
+            }
+            let buffer_size = get_io_buffer_frame_size_range(self.audio_device_id)?;
 
             // Collect the supported formats for the device.
 
@@ -687,18 +683,16 @@ impl Device {
                 };
 
             #[allow(non_upper_case_globals)]
-            let mode = match scope {
-                kAudioObjectPropertyScopeInput => AudioUnitMode::Input,
-                kAudioObjectPropertyScopeOutput => AudioUnitMode::Output,
+            match scope {
+                kAudioObjectPropertyScopeInput | kAudioObjectPropertyScopeOutput => {}
                 _ => {
                     return Err(Error::with_message(
                         ErrorKind::UnsupportedOperation,
                         format!("unexpected scope (neither input nor output): {scope:?}"),
                     ))
                 }
-            };
-            let audio_unit = audio_unit_from_device(self, mode)?;
-            let buffer_size = get_io_buffer_frame_size_range(&audio_unit)?;
+            }
+            let buffer_size = get_io_buffer_frame_size_range(self.audio_device_id)?;
 
             let config = SupportedStreamConfig {
                 sample_rate: asbd.mSampleRate as _,
@@ -827,6 +821,10 @@ impl Device {
             Ok(())
         })?;
 
+        // All properties and callbacks are now configured on the uninitialized unit.
+        // Initialize here so CoreAudio allocates its internal buffers for the actual format.
+        audio_unit.initialize()?;
+
         let inner_arc = Arc::new(Mutex::new(StreamInner {
             playing: true,
             audio_unit,
@@ -934,6 +932,10 @@ impl Device {
             data_callback(&mut data, &info);
             Ok(())
         })?;
+
+        // All properties and callbacks are now configured on the uninitialized unit.
+        // Initialize here so CoreAudio allocates its internal buffers for the actual format.
+        audio_unit.initialize()?;
 
         let inner_arc = Arc::new(Mutex::new(StreamInner {
             playing: true,
