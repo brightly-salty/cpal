@@ -1,8 +1,10 @@
 use crate::{
-    error::ResultExt, host::com::ComString, BufferSize, Data, DeviceDescription,
-    DeviceDescriptionBuilder, DeviceDirection, DeviceId, DeviceType, Error, ErrorKind, FrameCount,
-    InputCallbackInfo, InterfaceType, OutputCallbackInfo, SampleFormat, SampleRate, StreamConfig,
-    SupportedBufferSize, SupportedStreamConfig, SupportedStreamConfigRange, COMMON_SAMPLE_RATES,
+    error::ResultExt,
+    host::{com::ComString, ErrorCallbackArc},
+    BufferSize, Data, DeviceDescription, DeviceDescriptionBuilder, DeviceDirection, DeviceId,
+    DeviceType, Error, ErrorKind, FrameCount, InputCallbackInfo, InterfaceType, OutputCallbackInfo,
+    SampleFormat, SampleRate, StreamConfig, SupportedBufferSize, SupportedStreamConfig,
+    SupportedStreamConfigRange, COMMON_SAMPLE_RATES,
 };
 
 impl From<Audio::EDataFlow> for DeviceDirection {
@@ -138,13 +140,9 @@ impl DeviceTrait for Device {
         E: FnMut(Error) + Send + 'static,
     {
         let stream_inner = self.build_input_stream_raw_inner(config, sample_format, timeout)?;
+        let error_callback: ErrorCallbackArc = Arc::new(Mutex::new(error_callback));
         let monitor = self.default_device_monitor()?;
-        Ok(Stream::new_input(
-            stream_inner,
-            data_callback,
-            error_callback,
-            monitor,
-        ))
+        Stream::new_input(stream_inner, data_callback, error_callback, monitor)
     }
 
     fn build_output_stream_raw<D, E>(
@@ -160,13 +158,9 @@ impl DeviceTrait for Device {
         E: FnMut(Error) + Send + 'static,
     {
         let stream_inner = self.build_output_stream_raw_inner(config, sample_format, timeout)?;
+        let error_callback: ErrorCallbackArc = Arc::new(Mutex::new(error_callback));
         let monitor = self.default_device_monitor()?;
-        Ok(Stream::new_output(
-            stream_inner,
-            data_callback,
-            error_callback,
-            monitor,
-        ))
+        Stream::new_output(stream_inner, data_callback, error_callback, monitor)
     }
 }
 
