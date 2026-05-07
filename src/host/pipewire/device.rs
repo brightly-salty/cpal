@@ -19,11 +19,13 @@ use pipewire::{
 
 use super::stream::Stream;
 use crate::{
-    host::pipewire::utils::{audio, clock, default, node, DEVICE_ICON_NAME, METADATA_NAME},
     host::{
         emit_error,
-        pipewire::stream::{
-            DefaultDeviceMonitor, PwInitGuard, StreamCommand, StreamData, SUPPORTED_FORMATS,
+        pipewire::{
+            stream::{
+                DefaultDeviceMonitor, PwInitGuard, StreamCommand, StreamData, SUPPORTED_FORMATS,
+            },
+            utils::{audio, clock, default, node, DEVICE_ICON_NAME, METADATA_NAME},
         },
     },
     iter::{SupportedInputConfigs, SupportedOutputConfigs},

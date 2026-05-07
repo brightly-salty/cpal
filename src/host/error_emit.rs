@@ -4,8 +4,9 @@
 //! - Must not block (RT process callback): [`try_emit_error`]
 //! - Caller must not miss the error: [`emit_error`] (blocks until callback available)
 
-use crate::Error;
 use std::sync::{Mutex, TryLockError};
+
+use crate::Error;
 
 /// Deliver an error, blocking until the callback is available.
 pub(crate) fn emit_error<E>(callback: &Mutex<E>, error: Error)

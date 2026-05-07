@@ -1,38 +1,33 @@
-use super::{asbd_from_config, check_os_status, host_time_to_stream_instant};
-use super::{DefaultOutputMonitor, DisconnectManager, Stream};
-
-use crate::{
-    host::{
-        coreaudio::macos::{loopback::LoopbackDevice, StreamInner},
-        frames_to_duration,
+use std::{
+    fmt,
+    mem::{self, size_of},
+    ptr::{null, NonNull},
+    sync::{
+        mpsc::{channel, RecvTimeoutError},
+        Arc, Mutex,
     },
-    traits::DeviceTrait,
-    BufferSize, ChannelCount, Data, DeviceDescription, DeviceDescriptionBuilder, DeviceId, Error,
-    ErrorKind, FrameCount, InputCallbackInfo, InputStreamTimestamp, InterfaceType,
-    OutputCallbackInfo, OutputStreamTimestamp, ResultExt, SampleFormat, SampleRate, StreamConfig,
-    StreamInstant, SupportedBufferSize, SupportedStreamConfig, SupportedStreamConfigRange,
+    time::{Duration, Instant},
 };
 
-use coreaudio::audio_unit::audio_format::LinearPcmFlags;
-use coreaudio::audio_unit::macos_helpers::{
-    audio_unit_from_device_id_uninitialized, find_matching_physical_format,
-    set_device_physical_stream_format, RateListener,
-};
-use coreaudio::audio_unit::render_callback::{self, data};
 use coreaudio::audio_unit::{
+    audio_format::LinearPcmFlags,
+    macos_helpers::{
+        audio_unit_from_device_id_uninitialized, find_matching_physical_format, get_device_name,
+        set_device_physical_stream_format, RateListener,
+    },
+    render_callback::{self, data},
     AudioUnit, Element, SampleFormat as CoreAudioSampleFormat, Scope, StreamFormat,
 };
 use objc2_audio_toolbox::{
     kAudioOutputUnitProperty_CurrentDevice, kAudioUnitProperty_StreamFormat,
 };
-use objc2_core_audio::kAudioDevicePropertyDeviceUID;
-use objc2_core_audio::kAudioObjectPropertyElementMain;
 use objc2_core_audio::{
     kAudioAggregateDeviceClassID, kAudioDevicePropertyAvailableNominalSampleRates,
     kAudioDevicePropertyBufferFrameSize, kAudioDevicePropertyBufferFrameSizeRange,
-    kAudioDevicePropertyLatency, kAudioDevicePropertyNominalSampleRate,
-    kAudioDevicePropertySafetyOffset, kAudioDevicePropertyStreamConfiguration,
-    kAudioDevicePropertyStreamFormat, kAudioObjectPropertyClass, kAudioObjectPropertyElementMaster,
+    kAudioDevicePropertyDeviceUID, kAudioDevicePropertyLatency,
+    kAudioDevicePropertyNominalSampleRate, kAudioDevicePropertySafetyOffset,
+    kAudioDevicePropertyStreamConfiguration, kAudioDevicePropertyStreamFormat,
+    kAudioObjectPropertyClass, kAudioObjectPropertyElementMain, kAudioObjectPropertyElementMaster,
     kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyScopeInput,
     kAudioObjectPropertyScopeOutput, AudioClassID, AudioDeviceID, AudioObjectGetPropertyData,
     AudioObjectGetPropertyDataSize, AudioObjectID, AudioObjectPropertyAddress,
@@ -41,19 +36,24 @@ use objc2_core_audio::{
 use objc2_core_audio_types::{
     AudioBuffer, AudioBufferList, AudioStreamBasicDescription, AudioValueRange,
 };
-use objc2_core_foundation::CFString;
-use objc2_core_foundation::Type;
+use objc2_core_foundation::{CFString, Type};
 
 pub use super::enumerate::{SupportedInputConfigs, SupportedOutputConfigs};
-use std::fmt;
-use std::mem::{self, size_of};
-use std::ptr::{null, NonNull};
-use std::sync::mpsc::{channel, RecvTimeoutError};
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
-
-use crate::host::{try_emit_error, ErrorCallbackArc};
-use coreaudio::audio_unit::macos_helpers::get_device_name;
+use super::{
+    asbd_from_config, check_os_status, host_time_to_stream_instant, DefaultOutputMonitor,
+    DisconnectManager, Stream,
+};
+use crate::{
+    host::{
+        coreaudio::macos::{loopback::LoopbackDevice, StreamInner},
+        frames_to_duration, try_emit_error, ErrorCallbackArc,
+    },
+    traits::DeviceTrait,
+    BufferSize, ChannelCount, Data, DeviceDescription, DeviceDescriptionBuilder, DeviceId, Error,
+    ErrorKind, FrameCount, InputCallbackInfo, InputStreamTimestamp, InterfaceType,
+    OutputCallbackInfo, OutputStreamTimestamp, ResultExt, SampleFormat, SampleRate, StreamConfig,
+    StreamInstant, SupportedBufferSize, SupportedStreamConfig, SupportedStreamConfigRange,
+};
 
 /// Try to find a matching physical stream format on the device and apply it.
 ///
