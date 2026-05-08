@@ -390,16 +390,6 @@ macro_rules! impl_platform_host {
             type SupportedOutputConfigs = SupportedOutputConfigs;
             type Stream = Stream;
 
-            #[allow(deprecated)]
-            fn name(&self) -> Result<String, crate::Error> {
-                match self.0 {
-                    $(
-                        $(#[cfg($feat)])?
-                        DeviceInner::$HostVariant(ref d) => d.name(),
-                    )*
-                }
-            }
-
             fn description(&self) -> Result<crate::DeviceDescription, crate::Error> {
                 match self.0 {
                     $(
@@ -714,10 +704,10 @@ macro_rules! impl_platform_host {
         ///
         /// - [`ErrorKind::HostUnavailable`] if the host identified by `id` is not currently
         ///   reachable (e.g. the audio daemon is not running).
-        /// - [`ErrorKind::Other`] for unclassifiable initialization failures.
+        /// - [`ErrorKind::BackendError`] for unclassifiable initialization failures.
         ///
         /// [`ErrorKind::HostUnavailable`]: crate::ErrorKind::HostUnavailable
-        /// [`ErrorKind::Other`]: crate::ErrorKind::Other
+        /// [`ErrorKind::BackendError`]: crate::ErrorKind::BackendError
         pub fn host_from_id(id: HostId) -> Result<Host, crate::Error> {
             match id {
                 $(

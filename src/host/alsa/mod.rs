@@ -173,11 +173,6 @@ impl DeviceTrait for Device {
     type SupportedOutputConfigs = SupportedOutputConfigs;
     type Stream = Stream;
 
-    // ALSA overrides name() to return pcm_id directly instead of from description
-    fn name(&self) -> Result<String, Error> {
-        Self::name(self)
-    }
-
     fn description(&self) -> Result<DeviceDescription, Error> {
         Self::description(self)
     }
@@ -446,10 +441,6 @@ impl Device {
         };
 
         Ok(stream_inner)
-    }
-
-    fn name(&self) -> Result<String, Error> {
-        Ok(self.pcm_id.clone())
     }
 
     fn description(&self) -> Result<DeviceDescription, Error> {
@@ -1622,7 +1613,7 @@ impl From<alsa::Error> for Error {
             libc::EINVAL => Error::with_message(ErrorKind::InvalidInput, err.to_string()),
             libc::EPIPE => Error::with_message(ErrorKind::Xrun, err.to_string()),
             libc::ENOSYS => Error::with_message(ErrorKind::UnsupportedOperation, err.to_string()),
-            _ => Error::with_message(ErrorKind::Other, err.to_string()),
+            _ => Error::with_message(ErrorKind::BackendError, err.to_string()),
         }
     }
 }
