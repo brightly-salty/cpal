@@ -28,6 +28,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `SupportedStreamConfigRange::try_with_standard_sample_rate()` and `with_standard_sample_rate()`
   to select 48 kHz or 44.1 kHz from a range.
 - `realtime` feature for high-priority audio scheduling without a D-Bus build dependency.
+- Add `CODE_OF_CONDUCT.md`, `CONTRIBUTING.md` and `SECURITY.md`.
 - **AAudio**: Streams now request `PERFORMANCE_MODE_LOW_LATENCY` when the `realtime` feature is
   enabled; stream error callback receives `ErrorKind::RealtimeDenied` if not granted.
 - **ALSA**: `device_by_id()` now accepts PCM shorthand names such as `hw:0,0` and `plughw:foo`.
