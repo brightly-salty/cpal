@@ -3,6 +3,8 @@
 //! Default backend on Linux and BSD systems.
 
 extern crate alsa;
+#[cfg(feature = "realtime")]
+extern crate alsa_sys;
 extern crate libc;
 
 use std::{
@@ -396,7 +398,10 @@ impl Device {
         if buffer_size == 0 {
             return Err(Error::with_message(
                 ErrorKind::DeviceNotAvailable,
-                "initialization resulted in a null buffer",
+                format!(
+                    "device '{}': initialization resulted in a null buffer",
+                    self.pcm_id
+                ),
             ));
         }
 
@@ -405,7 +410,7 @@ impl Device {
         if handle.count() == 0 {
             return Err(Error::with_message(
                 ErrorKind::DeviceNotAvailable,
-                "poll descriptor count for stream was 0",
+                format!("device '{}': poll descriptor count is 0", self.pcm_id),
             ));
         }
 
@@ -431,6 +436,7 @@ impl Device {
         let stream_inner = StreamInner {
             dropping: AtomicBool::new(false),
             handle,
+            pcm_id: self.pcm_id.clone(),
             sample_format,
             sample_rate: conf.sample_rate,
             frame_size,
@@ -622,7 +628,10 @@ impl Device {
                 Err(err) if err.kind() == ErrorKind::InvalidInput => {
                     return Err(Error::with_message(
                         ErrorKind::UnsupportedOperation,
-                        "device does not support the requested direction",
+                        format!(
+                            "device '{}' does not support the requested direction",
+                            self.pcm_id
+                        ),
                     ));
                 }
                 Err(err) => return Err(err),
@@ -638,7 +647,7 @@ impl Device {
                 .unwrap_or_else(|| f.with_max_sample_rate())),
             None => Err(Error::with_message(
                 ErrorKind::UnsupportedConfig,
-                "no supported configuration for this device",
+                format!("device '{}': no supported configuration", self.pcm_id),
             )),
         }
     }
@@ -730,6 +739,9 @@ struct StreamInner {
 
     // The ALSA handle.
     handle: alsa::pcm::PCM,
+
+    // ALSA PCM identifier used to open this stream.
+    pcm_id: String,
 
     // Format of the samples.
     sample_format: SampleFormat,
@@ -995,6 +1007,52 @@ fn output_stream_worker(
 fn boost_current_thread_priority(
     stream: &StreamInner,
 ) -> Result<audio_thread_priority::RtPriorityHandle, Error> {
+    use alsa_sys::*;
+    // SAFETY: `alsa::pcm::PCM` is `pub struct PCM(*mut snd_pcm_t, Cell<bool>)`. The crate
+    // does not expose a public `as_ptr()`, but we can cast and read from it.
+    // TODO: replace with `stream.handle.as_ptr()` once alsa-rs exposes it publicly.
+    let raw = unsafe {
+        (&stream.handle as *const alsa::pcm::PCM)
+            .cast::<*mut snd_pcm_t>()
+            .read()
+    };
+    let pcm_type = unsafe { snd_pcm_type(raw) };
+
+    // Only promote to RT for kernel-backed and pure-computation plugins. Others can exhaust
+    // RLIMIT_RTTIME when they block or coordinate with non-RT servers and trigger SIGXCPU
+    // on an RT thread. IOPLUG and EXTPLUG are excluded: no reliable way to distinguish
+    // RT-safe drivers (e.g. pipewire-alsa) from server-backed ones (e.g. pcm_pulse).
+    if !matches!(
+        pcm_type,
+        SND_PCM_TYPE_HW
+            | SND_PCM_TYPE_HOOKS
+            | SND_PCM_TYPE_NULL
+            | SND_PCM_TYPE_COPY
+            | SND_PCM_TYPE_LINEAR
+            | SND_PCM_TYPE_ALAW
+            | SND_PCM_TYPE_MULAW
+            | SND_PCM_TYPE_ADPCM
+            | SND_PCM_TYPE_RATE
+            | SND_PCM_TYPE_ROUTE
+            | SND_PCM_TYPE_PLUG
+            | SND_PCM_TYPE_LINEAR_FLOAT
+            | SND_PCM_TYPE_IEC958
+            | SND_PCM_TYPE_SOFTVOL
+    ) {
+        let type_name = unsafe {
+            std::ffi::CStr::from_ptr(snd_pcm_type_name(pcm_type))
+                .to_str()
+                .unwrap_or("unknown")
+        };
+        return Err(Error::with_message(
+            ErrorKind::RealtimeDenied,
+            format!(
+                "device '{}' ({type_name}) cannot be promoted to real-time priority",
+                stream.pcm_id,
+            ),
+        ));
+    }
+
     let period_frames = u32::try_from(stream.period_size).unwrap_or(0);
     audio_thread_priority::promote_current_thread_to_real_time(period_frames, stream.sample_rate)
         .map_err(Error::from)
@@ -1080,7 +1138,7 @@ fn poll_for_period(
     if revents.intersects(alsa::poll::Flags::HUP | alsa::poll::Flags::NVAL) {
         return Err(Error::with_message(
             ErrorKind::DeviceNotAvailable,
-            "device disconnected",
+            format!("device '{}' disconnected", stream.pcm_id),
         ));
     }
     // POLLERR signals an xrun or suspend; avail_delay() below returns EPIPE/ESTRPIPE accordingly.
@@ -1376,7 +1434,7 @@ impl StreamTrait for Stream {
         if !hw_params.can_pause() {
             return Err(Error::with_message(
                 ErrorKind::UnsupportedOperation,
-                "hardware does not support pausing this stream",
+                format!("device '{}' does not support pausing", self.inner.pcm_id),
             ));
         }
         if self.inner.handle.state() != alsa::pcm::State::Paused {
