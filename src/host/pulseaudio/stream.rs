@@ -1,6 +1,6 @@
 use std::{
     sync::{
-        atomic::{self, AtomicBool, AtomicU64},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Condvar, Mutex,
     },
     time::{Duration, Instant},
@@ -11,7 +11,7 @@ use futures::FutureExt as _;
 use pulseaudio::{protocol, AsPlaybackSource};
 
 use crate::{
-    host::{emit_error, ErrorCallbackArc},
+    host::{emit_error, latch::Latch, ErrorCallbackArc},
     traits::StreamTrait,
     Data, Error, ErrorKind, FrameCount, InputCallbackInfo, InputStreamTimestamp,
     OutputCallbackInfo, OutputStreamTimestamp, SampleFormat, StreamInstant,
@@ -44,7 +44,7 @@ impl LatencyHandle {
 
     // Signal cancellation and wake the thread immediately
     fn cancel(&self) {
-        self.cancel.store(true, atomic::Ordering::Relaxed);
+        self.cancel.store(true, Ordering::Relaxed);
         self.notify();
     }
 }
@@ -57,6 +57,7 @@ enum StreamInner {
 pub struct Stream {
     inner: StreamInner,
     workers: Vec<std::thread::JoinHandle<()>>,
+    latch: Latch,
 }
 
 impl Drop for Stream {
@@ -74,6 +75,10 @@ impl Drop for Stream {
                 handle.cancel();
             }
         }
+
+        // Unpark the threads in case they're sleeping.
+        self.signal_ready();
+
         for handle in self.workers.drain(..) {
             // Prevent self-join: a worker thread may surface an error
             // through the user's error_callback, and that callback may
@@ -188,8 +193,8 @@ impl Stream {
             // Interpolate the latency based on elapsed time since the last
             // poll: as audio plays, the DAC drains the buffer at a constant
             // rate, so the latency decreases linearly between polls.
-            let stored_latency = latency_clone.load(atomic::Ordering::Relaxed);
-            let poll_usec = poll_clone.load(atomic::Ordering::Relaxed);
+            let stored_latency = latency_clone.load(Ordering::Relaxed);
+            let poll_usec = poll_clone.load(Ordering::Relaxed);
             // Cap to LATENCY_MAX_INTERVAL: the linear-drain assumption is only valid for that
             // window, and a stale poll_usec (e.g. after cork/uncork where timing_info blocks)
             // would otherwise saturate latency to zero.
@@ -243,18 +248,18 @@ impl Stream {
         let error_callback_clone = error_callback.clone();
         let cancel_driver = handle.cancel.clone();
 
-        // The barrier prevents the worker and latency threads from firing callbacks before the
-        // caller has received the Stream handle.
-        let ready = std::sync::Arc::new(std::sync::Barrier::new(3));
+        // The latch is released just before the `Stream` is returned so the driver and latency
+        // threads cannot fire any callbacks before the caller has the handle.
+        let mut latch = Latch::new();
+        let waiter_driver = latch.waiter();
 
-        let ready_worker = ready.clone();
         let driver_handle = std::thread::spawn(move || {
-            ready_worker.wait();
+            waiter_driver.wait();
             if let Err(e) = block_on(stream_clone.play_all()) {
                 // A server playback error is expected when the client
                 // closes their stream. No need to report it back to
                 // the client.
-                if !cancel_driver.load(atomic::Ordering::Relaxed) {
+                if !cancel_driver.load(Ordering::Relaxed) {
                     emit_error(&error_callback_clone, Error::from(e));
                 }
             }
@@ -266,11 +271,11 @@ impl Stream {
         let latency_clone = current_latency_micros.clone();
         let poll_clone = last_poll_micros.clone();
 
-        let ready_latency = ready.clone();
+        let waiter_latency = latch.waiter();
         let latency_handle = std::thread::spawn(move || {
-            ready_latency.wait();
+            waiter_latency.wait();
             loop {
-                if cancel_thread.load(atomic::Ordering::Relaxed) {
+                if cancel_thread.load(Ordering::Relaxed) {
                     break;
                 }
 
@@ -284,7 +289,7 @@ impl Stream {
 
                 let poll_since_epoch =
                     Instant::now().saturating_duration_since(start).as_micros() as u64;
-                poll_clone.store(poll_since_epoch, atomic::Ordering::Relaxed);
+                poll_clone.store(poll_since_epoch, Ordering::Relaxed);
 
                 store_latency(
                     &latency_clone,
@@ -304,10 +309,12 @@ impl Stream {
             }
         });
 
-        ready.wait();
+        latch.add_thread(driver_handle.thread().clone());
+        latch.add_thread(latency_handle.thread().clone());
         Ok(Self {
             inner: StreamInner::Playback(stream, start, handle),
             workers: vec![driver_handle, latency_handle],
+            latch,
         })
     }
 
@@ -349,8 +356,8 @@ impl Stream {
             // Interpolate the latency based on elapsed time since the last poll: as audio records,
             // the ADC fills the buffer at a constant rate, so the latency increases linearly
             // between polls.
-            let stored_latency = latency_clone.load(atomic::Ordering::Relaxed);
-            let poll_usec = poll_clone.load(atomic::Ordering::Relaxed);
+            let stored_latency = latency_clone.load(Ordering::Relaxed);
+            let poll_usec = poll_clone.load(Ordering::Relaxed);
             // Cap to LATENCY_MAX_INTERVAL: the linear-fill assumption is only valid for that
             // window, and a stale poll_usec (e.g. after cork/uncork where timing_info blocks)
             // would otherwise keep inflating the interpolated latency up to the cap.
@@ -395,44 +402,60 @@ impl Stream {
         let stream_clone = stream.clone();
         let latency_clone = current_latency_micros.clone();
         let poll_clone = last_poll_micros.clone();
-        let latency_handle = std::thread::spawn(move || loop {
-            if cancel_thread.load(atomic::Ordering::Relaxed) {
-                break;
-            }
 
-            let timing_info = match block_on(stream_clone.timing_info()) {
-                Ok(timing_info) => timing_info,
-                Err(e) => {
-                    error_callback(Error::from(e));
+        // The latch is released just before the `Stream` is returned so the latency thread cannot
+        // fire any callbacks before the caller has the handle.
+        let mut latch = Latch::new();
+        let waiter_latency = latch.waiter();
+
+        let latency_handle = std::thread::spawn(move || {
+            waiter_latency.wait();
+            loop {
+                if cancel_thread.load(Ordering::Relaxed) {
                     break;
                 }
-            };
 
-            let poll_since_epoch =
-                Instant::now().saturating_duration_since(start).as_micros() as u64;
-            poll_clone.store(poll_since_epoch, atomic::Ordering::Relaxed);
+                let timing_info = match block_on(stream_clone.timing_info()) {
+                    Ok(timing_info) => timing_info,
+                    Err(e) => {
+                        error_callback(Error::from(e));
+                        break;
+                    }
+                };
 
-            store_latency(
-                &latency_clone,
-                sample_spec,
-                timing_info.source_usec,
-                timing_info.write_offset,
-                timing_info.read_offset,
-            );
+                let poll_since_epoch =
+                    Instant::now().saturating_duration_since(start).as_micros() as u64;
+                poll_clone.store(poll_since_epoch, Ordering::Relaxed);
 
-            // Wait until woken by a read/play/pause/drop event or until LATENCY_MAX_INTERVAL.
-            let (lock, cvar) = &*update_thread;
-            let Ok(guard) = lock.lock() else { break };
-            let (mut guard, _) = cvar
-                .wait_timeout_while(guard, LATENCY_MAX_INTERVAL, |notified| !*notified)
-                .unwrap_or_else(|e| e.into_inner());
-            *guard = false;
+                store_latency(
+                    &latency_clone,
+                    sample_spec,
+                    timing_info.source_usec,
+                    timing_info.write_offset,
+                    timing_info.read_offset,
+                );
+
+                // Wait until woken by a read/play/pause/drop event or until LATENCY_MAX_INTERVAL.
+                let (lock, cvar) = &*update_thread;
+                let Ok(guard) = lock.lock() else { break };
+                let (mut guard, _) = cvar
+                    .wait_timeout_while(guard, LATENCY_MAX_INTERVAL, |notified| !*notified)
+                    .unwrap_or_else(|e| e.into_inner());
+                *guard = false;
+            }
         });
 
+        latch.add_thread(latency_handle.thread().clone());
         Ok(Self {
             inner: StreamInner::Record(stream, start, handle),
             workers: vec![latency_handle],
+            latch,
         })
+    }
+
+    /// Releases the latch so the worker thread can begin processing audio callbacks.
+    pub(crate) fn signal_ready(&self) {
+        self.latch.release();
     }
 }
 
@@ -450,6 +473,6 @@ fn store_latency(
 
     latency_micros.store(
         latency.as_micros().try_into().unwrap_or(u64::MAX),
-        atomic::Ordering::Relaxed,
+        Ordering::Relaxed,
     );
 }

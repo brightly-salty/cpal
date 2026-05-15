@@ -22,6 +22,7 @@ use crate::{
     host::{
         equilibrium::{fill_equilibrium, DSD_EQUILIBRIUM_BYTE, U8_EQUILIBRIUM_BYTE},
         frames_to_duration,
+        latch::Latch,
     },
     iter::{SupportedInputConfigs, SupportedOutputConfigs},
     traits::{DeviceTrait, HostTrait, StreamTrait},
@@ -236,6 +237,7 @@ impl DeviceTrait for Device {
             error_callback,
             timeout,
         );
+        stream.signal_ready();
         Ok(stream)
     }
 
@@ -259,6 +261,7 @@ impl DeviceTrait for Device {
             error_callback,
             timeout,
         );
+        stream.signal_ready();
         Ok(stream)
     }
 }
@@ -773,6 +776,10 @@ pub struct Stream {
     /// Keeps the read end of the self-pipe alive for the lifetime of the Stream, so that
     /// `trigger.wakeup()` never writes to a closed pipe, even if the worker exited early.
     _rx: Arc<TriggerReceiver>,
+
+    /// Latch that prevents the worker thread from firing callbacks until the caller has received
+    /// the `Stream` handle.
+    latch: Latch,
 }
 
 // Compile-time assertion that Stream is Send and Sync
@@ -1251,6 +1258,11 @@ fn htstamp_elapsed(status: &alsa::pcm::Status, origin: libc::timespec) -> Stream
 }
 
 impl Stream {
+    /// Releases the latch so the worker thread can begin processing audio callbacks.
+    pub(crate) fn signal_ready(&self) {
+        self.latch.release();
+    }
+
     fn new_input<D, E>(
         inner: Arc<StreamInner>,
         mut data_callback: D,
@@ -1265,16 +1277,15 @@ impl Stream {
         let rx_thread = rx.clone();
         let stream = inner.clone();
 
-        // The barrier prevents the worker from firing data callbacks before the caller has
-        // received the Stream handle. Without it, callbacks could arrive before the caller can
-        // pause, stop, or drop the stream.
-        let ready = std::sync::Arc::new(std::sync::Barrier::new(2));
-        let ready_worker = ready.clone();
+        // The latch is released just before the `Stream` is returned so the worker cannot fire any
+        // callbacks before the caller has the handle.
+        let mut latch = Latch::new();
+        let waiter = latch.waiter();
 
         let thread = thread::Builder::new()
             .name("cpal_alsa_in".to_owned())
             .spawn(move || {
-                ready_worker.wait();
+                waiter.wait();
                 input_stream_worker(
                     rx_thread,
                     &stream,
@@ -1284,15 +1295,15 @@ impl Stream {
                 );
             })
             .unwrap();
-        let stream = Self {
+        latch.add_thread(thread.thread().clone());
+
+        Self {
             thread: Some(thread),
             inner,
             trigger: tx,
             _rx: rx,
-        };
-
-        ready.wait();
-        stream
+            latch,
+        }
     }
 
     fn new_output<D, E>(
@@ -1309,16 +1320,15 @@ impl Stream {
         let rx_thread = rx.clone();
         let stream = inner.clone();
 
-        // The barrier prevents the worker from firing data callbacks before the caller has
-        // received the Stream handle. Without it, callbacks could arrive before the caller can
-        // pause, stop, or drop the stream.
-        let ready = std::sync::Arc::new(std::sync::Barrier::new(2));
-        let ready_worker = ready.clone();
+        // The latch is released just before the `Stream` is returned so the worker cannot fire any
+        // callbacks before the caller has the handle.
+        let mut latch = Latch::new();
+        let waiter = latch.waiter();
 
         let thread = thread::Builder::new()
             .name("cpal_alsa_out".to_owned())
             .spawn(move || {
-                ready_worker.wait();
+                waiter.wait();
                 output_stream_worker(
                     rx_thread,
                     &stream,
@@ -1328,21 +1338,23 @@ impl Stream {
                 );
             })
             .unwrap();
+        latch.add_thread(thread.thread().clone());
 
-        let stream = Self {
+        Self {
             thread: Some(thread),
             inner,
             trigger: tx,
             _rx: rx,
-        };
-
-        ready.wait();
-        stream
+            latch,
+        }
     }
 }
 
 impl Drop for Stream {
     fn drop(&mut self) {
+        // Unblock the worker in case the stream is dropped before signal_ready() was
+        // called. Idempotent: no effect if the worker is already running.
+        self.signal_ready();
         self.inner.dropping.store(true, Ordering::Release);
         self.trigger.wakeup();
         if let Some(handle) = self.thread.take() {

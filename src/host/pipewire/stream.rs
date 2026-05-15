@@ -28,8 +28,8 @@ use pipewire::{
 
 use crate::{
     host::{
-        emit_error, equilibrium::fill_equilibrium, frames_to_duration, try_emit_error,
-        ErrorCallbackArc,
+        emit_error, equilibrium::fill_equilibrium, frames_to_duration, latch::Latch,
+        try_emit_error, ErrorCallbackArc,
     },
     traits::StreamTrait,
     Data, Error, ErrorKind, FrameCount, InputCallbackInfo, InputStreamTimestamp,
@@ -75,14 +75,40 @@ pub enum StreamCommand {
 }
 
 pub struct Stream {
-    pub(crate) handle: Option<JoinHandle<()>>,
-    pub(crate) controller: pw::channel::Sender<StreamCommand>,
-    pub(crate) last_quantum: Arc<AtomicU64>,
-    pub(crate) start: Instant,
+    handle: Option<JoinHandle<()>>,
+    controller: pw::channel::Sender<StreamCommand>,
+    last_quantum: Arc<AtomicU64>,
+    start: Instant,
+    latch: Latch,
+}
+
+impl Stream {
+    pub(crate) fn new(
+        handle: JoinHandle<()>,
+        controller: pw::channel::Sender<StreamCommand>,
+        last_quantum: Arc<AtomicU64>,
+        start: Instant,
+        latch: Latch,
+    ) -> Self {
+        Self {
+            handle: Some(handle),
+            controller,
+            last_quantum,
+            start,
+            latch,
+        }
+    }
+
+    /// Releases the latch so the worker thread can begin processing audio callbacks.
+    pub fn signal_ready(&self) {
+        self.latch.release();
+    }
 }
 
 impl Drop for Stream {
     fn drop(&mut self) {
+        // Unblock the worker in case the stream is dropped before signal_ready() was called.
+        self.signal_ready();
         let _ = self.controller.send(StreamCommand::Stop);
         if let Some(handle) = self.handle.take() {
             // Prevent self-join: Stop was sent; the handle detaches and the thread exits after
@@ -626,6 +652,7 @@ where
             if n_channels == 0 {
                 return; // format not yet negotiated by param_changed
             }
+
             if let Some(mut buffer) = stream.dequeue_buffer() {
                 // Read the requested frame count before mutably borrowing datas_mut().
                 let requested = buffer.requested() as usize;
@@ -685,7 +712,7 @@ where
 
     // RT_PROCESS is intentionally absent: with add_local_listener the process callback always
     // runs on this mainloop thread, not the separate data-loop thread RT_PROCESS creates.
-    // The mainloop thread is promoted to RT by the caller (device.rs) before mainloop.run().
+    // The worker thread is promoted to RT after signalling the main thread (see device.rs).
     let flags = pw::stream::StreamFlags::AUTOCONNECT | pw::stream::StreamFlags::MAP_BUFFERS;
 
     stream.connect(pw::spa::utils::Direction::Output, None, flags, &mut params)?;
@@ -858,6 +885,7 @@ where
             if n_channels == 0 {
                 return; // format not yet negotiated by param_changed
             }
+
             if let Some(mut buffer) = stream.dequeue_buffer() {
                 let datas = buffer.datas_mut();
                 if datas.is_empty() {
@@ -899,7 +927,7 @@ where
 
     // RT_PROCESS is intentionally absent: with add_local_listener the process callback always
     // runs on this mainloop thread, not the separate data-loop thread RT_PROCESS creates.
-    // The mainloop thread is promoted to RT by the caller (device.rs) before mainloop.run().
+    // The worker thread is promoted to RT after signalling the main thread (see device.rs).
     let flags = pw::stream::StreamFlags::AUTOCONNECT | pw::stream::StreamFlags::MAP_BUFFERS;
 
     stream.connect(pw::spa::utils::Direction::Input, None, flags, &mut params)?;
